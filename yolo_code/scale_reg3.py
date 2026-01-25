@@ -2,16 +2,16 @@ from unittest import result
 import cv2
 from matplotlib import image
 import numpy as np
-from paddle import crop
+#from paddle import crop
 from ultralytics import YOLO
 from paddleocr import PaddleOCR
 import re
 
 # ========== 1️⃣ 加载模型 ==========
 yolo_model = YOLO('./runs/detect/train/weights/best.pt')  # YOLO模型路径
-ocr = PaddleOCR(use_textline_orientation=True, lang='ch')  # OCR模型（可识别 μm）
-
-# ========== 2️⃣ YOLO检测比例尺 ==========
+#ocr = PaddleOCR(use_textline_orientation=True, lang='ch')  # OCR模型（可识别 μm）
+# 关闭方向检测，scale bar 一般都是水平的，不需要这个功能
+ocr = PaddleOCR(use_angle_cls=False, lang='ch', show_log=False)
 def detect_scale(image_path, conf_thresh=0.3):  # 降低置信度阈值方便调试
     image = cv2.imread(image_path)
     if image is None:
@@ -181,4 +181,4 @@ def process_image(image_path):
 # ========== 示例调用 ==========
 if __name__ == "__main__":
     #process_image(r'E:\G_data\畴区\畴区\02-散图\畴区光镜数据20x-2\20250107-26.jpg')
-    process_image(r'E:\nanojc\frame\11dd74426e8374ac110c4036c77c09ab_000000000000.jpg')
+    process_image('../data/frame/11dd74426e8374ac110c4036c77c09ab_000000000000.jpg')
