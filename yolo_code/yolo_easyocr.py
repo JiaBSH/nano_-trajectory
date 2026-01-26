@@ -108,7 +108,7 @@ def _annotate_and_save(image, image_path: str, detections, scale_text: str | Non
             )
 
     out_dir = out_dir or _default_output_dir()
-    annotated_dir = _ensure_dir(os.path.join(out_dir, "annotated"))
+    annotated_dir = _ensure_dir(os.path.join(out_dir, "scalebar_annotated"))
     stem = os.path.splitext(os.path.basename(image_path))[0]
     out_path = os.path.join(annotated_dir, f"{stem}_scale_bar.jpg")
     cv2.imwrite(out_path, annotated)
@@ -355,7 +355,11 @@ def process_folder(
     if not in_dir.exists() or not in_dir.is_dir():
         raise FileNotFoundError(f"输入文件夹不存在: {input_dir}")
 
-    out_dir = out_dir or _default_output_dir()
+    # 默认输出目录：如果未指定 out_dir，则使用 input_dir 的上一级目录下的 "temp" 文件夹
+    if out_dir is None:
+        parent_dir = in_dir.parent
+        #out_dir = os.path.join(str(parent_dir), "temp")
+        out_dir = parent_dir
     _ensure_dir(out_dir)
 
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -363,8 +367,8 @@ def process_folder(
     image_paths = [p for p in iterator if _is_image_file(p, exts)]
     image_paths.sort()
 
-    results_json_path = os.path.join(out_dir, "results.json")
-    results_csv_path = os.path.join(out_dir, "results.csv")
+    results_json_path = os.path.join(out_dir, "scalebar_results.json")
+    results_csv_path = os.path.join(out_dir, "scalebar_results.csv")
 
     all_rows: list[dict] = []
     print(f"\n=== 批量处理开始 ===")

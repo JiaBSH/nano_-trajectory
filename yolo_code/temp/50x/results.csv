@@ -1,7 +1,0 @@
-image,annotated_image,scale_value,unit,pixel_length,ratio,error
-D:\code\bl0116\big_data\cq_data\50x\image\50x-1.png,./temp/50x\annotated\50x-1_scale_bar.jpg,20.0,μm,352.0568135968966,0.056809012714919095,
-D:\code\bl0116\big_data\cq_data\50x\image\50x-2.png,./temp/50x\annotated\50x-2_scale_bar.jpg,20.0,μm,355.0394344294729,0.05633177067256994,
-D:\code\bl0116\big_data\cq_data\50x\image\50x-3.png,./temp/50x\annotated\50x-3_scale_bar.jpg,20.0,μm,353.0509878190401,0.05664904132841913,
-D:\code\bl0116\big_data\cq_data\50x\image\50x-4.png,./temp/50x\annotated\50x-4_scale_bar.jpg,20.0,μm,354.04519485512014,0.05648996311949456,
-D:\code\bl0116\big_data\cq_data\50x\image\50x-5.png,./temp/50x\annotated\50x-5_scale_bar.jpg,20.0,μm,352.0568135968966,0.056809012714919095,
-D:\code\bl0116\big_data\cq_data\50x\image\50x-6.png,./temp/50x\annotated\50x-6_scale_bar.jpg,20.0,μm,354.04519485512014,0.05648996311949456,
