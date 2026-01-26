@@ -1,10 +1,14 @@
-from unittest import result
 import cv2
 import numpy as np
 from ultralytics import YOLO
 import easyocr  # <--- 1. 改用 EasyOCR
 import re
 import os
+import json
+import csv
+from datetime import datetime
+from pathlib import Path
+import argparse
 
 # ========== 1️⃣ 加载模型 ==========
 # YOLO 继续用，它工作得很完美
@@ -16,7 +20,7 @@ reader = easyocr.Reader(['en'], gpu=False)
 
 # ========== 2️⃣ YOLO检测比例尺 ==========
 def detect_scale(image_path, conf_thresh=0.3): 
-    image = cv2.imread(image_path)
+    image = cv2.imread(str(image_path))
     if image is None:
         print(f"❌ 图像路径错误或无法读取: {image_path}")
         return None, None, None, []
@@ -40,24 +44,36 @@ def detect_scale(image_path, conf_thresh=0.3):
         detections.append({
             "label": str(label),
             "conf": conf,
-            "xyxy": xyxy,
+            # JSON 友好：转成普通 list
+            "xyxy": [int(v) for v in xyxy],
         })
         if label.lower() == "scale_bar":
             scale_bar_box = xyxy
         elif label.lower() == "scale_text":
             scale_text_box = xyxy
 
+    # scale_*_box 同样转成 list[int]
+    if scale_bar_box is not None:
+        scale_bar_box = [int(v) for v in scale_bar_box]
+    if scale_text_box is not None:
+        scale_text_box = [int(v) for v in scale_text_box]
+
     return image, scale_bar_box, scale_text_box, detections
 
 
-def _ensure_output_dir() -> str:
+def _default_output_dir() -> str:
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
     out_dir = os.path.join(repo_root, "temp")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
 
 
-def _annotate_and_save(image, image_path: str, detections, scale_text: str | None = None):
+def _ensure_dir(path: str) -> str:
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def _annotate_and_save(image, image_path: str, detections, scale_text: str | None = None, out_dir: str | None = None):
     if image is None:
         return None
 
@@ -91,9 +107,10 @@ def _annotate_and_save(image, image_path: str, detections, scale_text: str | Non
                 lineType=cv2.LINE_AA,
             )
 
-    out_dir = _ensure_output_dir()
+    out_dir = out_dir or _default_output_dir()
+    annotated_dir = _ensure_dir(os.path.join(out_dir, "annotated"))
     stem = os.path.splitext(os.path.basename(image_path))[0]
-    out_path = os.path.join(out_dir, f"{stem}_scale_bar.jpg")
+    out_path = os.path.join(annotated_dir, f"{stem}_scale_bar.jpg")
     cv2.imwrite(out_path, annotated)
     print(f"✅ 标注结果已保存: {out_path}")
     return out_path
@@ -216,5 +233,146 @@ def process_image(image_path):
         ocr_text_for_label = f"{scale_value}{unit}"
     _annotate_and_save(image, image_path, detections, scale_text=ocr_text_for_label)
 
+
+def _is_image_file(path: Path, exts: set[str]) -> bool:
+    return path.is_file() and path.suffix.lower() in exts
+
+
+def process_folder(
+    input_dir: str,
+    out_dir: str | None = None,
+    conf_thresh: float = 0.3,
+    recursive: bool = False,
+    write_csv: bool = True,
+):
+    in_dir = Path(input_dir)
+    if not in_dir.exists() or not in_dir.is_dir():
+        raise FileNotFoundError(f"输入文件夹不存在: {input_dir}")
+
+    out_dir = out_dir or _default_output_dir()
+    _ensure_dir(out_dir)
+
+    exts = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    iterator = in_dir.rglob("*") if recursive else in_dir.glob("*")
+    image_paths = [p for p in iterator if _is_image_file(p, exts)]
+    image_paths.sort()
+
+    results_json_path = os.path.join(out_dir, "results.json")
+    results_csv_path = os.path.join(out_dir, "results.csv")
+
+    all_rows: list[dict] = []
+    print(f"\n=== 批量处理开始 ===")
+    print(f"输入文件夹: {in_dir}")
+    print(f"图片数量:   {len(image_paths)}")
+    print(f"输出目录:   {out_dir}")
+
+    for idx, img_path in enumerate(image_paths, start=1):
+        print(f"\n[{idx}/{len(image_paths)}] 处理: {img_path}")
+        row: dict = {
+            "image": str(img_path),
+            "annotated_image": None,
+            "scale_value": None,
+            "unit": None,
+            "pixel_length": None,
+            "ratio": None,
+            "detections": [],
+            "error": None,
+        }
+
+        try:
+            image, scale_bar_box, scale_text_box, detections = detect_scale(str(img_path), conf_thresh=conf_thresh)
+            row["detections"] = detections
+
+            if image is None:
+                row["error"] = "image_read_failed"
+                all_rows.append(row)
+                continue
+
+            scale_value = None
+            unit = "μm"
+            ocr_text_for_label = None
+
+            if scale_text_box is not None:
+                text = recognize_scale_text(image, scale_text_box)
+                scale_value, unit = parse_scale_text(text)
+
+            if scale_value is None:
+                row["error"] = "scale_text_parse_failed"
+                # 依然把检测框画出来，方便排查
+                row["annotated_image"] = _annotate_and_save(image, str(img_path), detections, scale_text=None, out_dir=out_dir)
+                all_rows.append(row)
+                continue
+
+            ratio, pixel_length = compute_scale_ratio(scale_bar_box, scale_value)
+            if ratio is None:
+                row["error"] = "scale_bar_not_found"
+                row["annotated_image"] = _annotate_and_save(image, str(img_path), detections, scale_text=f"{scale_value}{unit}", out_dir=out_dir)
+                all_rows.append(row)
+                continue
+
+            row["scale_value"] = float(scale_value)
+            row["unit"] = unit
+            row["pixel_length"] = float(pixel_length) if pixel_length is not None else None
+            row["ratio"] = float(ratio)
+
+            ocr_text_for_label = f"{scale_value}{unit}"
+            row["annotated_image"] = _annotate_and_save(image, str(img_path), detections, scale_text=ocr_text_for_label, out_dir=out_dir)
+
+        except Exception as e:
+            row["error"] = f"exception: {type(e).__name__}: {e}"
+
+        all_rows.append(row)
+
+    payload = {
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "input_dir": str(in_dir),
+        "out_dir": str(out_dir),
+        "count": len(all_rows),
+        "results": all_rows,
+    }
+    with open(results_json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    if write_csv:
+        with open(results_csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=[
+                    "image",
+                    "annotated_image",
+                    "scale_value",
+                    "unit",
+                    "pixel_length",
+                    "ratio",
+                    "error",
+                ],
+            )
+            writer.writeheader()
+            for r in all_rows:
+                writer.writerow({k: r.get(k) for k in writer.fieldnames})
+
+    print("\n=== 批量处理完成 ===")
+    print(f"结果JSON: {results_json_path}")
+    if write_csv:
+        print(f"结果CSV:  {results_csv_path}")
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="YOLO + EasyOCR 批量识别比例尺并保存标注结果")
+    parser.add_argument("--input_dir", type=str, required=True, help="待处理图片文件夹")
+    parser.add_argument("--out_dir", type=str, default=None, help="输出目录（默认: yolo_code/temp）")
+    parser.add_argument("--conf", type=float, default=0.3, help="YOLO 置信度阈值")
+    parser.add_argument("--recursive", action="store_true", help="递归遍历子目录")
+    parser.add_argument("--no_csv", action="store_true", help="不输出 results.csv，仅输出 results.json")
+    return parser
+
 if __name__ == "__main__":
-    process_image(r'D:\code\bl0116\big_data\cq_data\20x\image\20x-1.png')
+    parser = _build_arg_parser()
+    args = parser.parse_args()
+    process_folder(
+        input_dir=args.input_dir,
+        out_dir=args.out_dir,
+        conf_thresh=args.conf,
+        recursive=args.recursive,
+        write_csv=not args.no_csv,
+    )
