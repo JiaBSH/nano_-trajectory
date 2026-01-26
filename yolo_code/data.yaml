@@ -1,0 +1,5 @@
+train: ../big_data/yolo_dataset/images/train
+val: ../big_data/yolo_dataset/images/val
+
+nc: 2
+names: ['scale_bar', 'scale_text']

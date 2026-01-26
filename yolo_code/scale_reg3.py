@@ -11,7 +11,7 @@ import re
 yolo_model = YOLO('./runs/detect/train/weights/best.pt')  # YOLO模型路径
 #ocr = PaddleOCR(use_textline_orientation=True, lang='ch')  # OCR模型（可识别 μm）
 # 关闭方向检测，scale bar 一般都是水平的，不需要这个功能
-ocr = PaddleOCR(use_angle_cls=False, lang='ch', show_log=False)
+ocr = PaddleOCR(use_angle_cls=False, lang='ch', use_gpu=False,enable_mkldnn=False,show_log=False)
 def detect_scale(image_path, conf_thresh=0.3):  # 降低置信度阈值方便调试
     image = cv2.imread(image_path)
     if image is None:
@@ -37,9 +37,74 @@ def detect_scale(image_path, conf_thresh=0.3):  # 降低置信度阈值方便调
             scale_text_box = xyxy
 
     return image, scale_bar_box, scale_text_box
-
-# ========== 3️⃣ OCR识别比例尺文字 ==========
+# ========== 3️⃣ OCR识别比例尺文字 (修正版) ==========
 def recognize_scale_text(image, text_box):
+    if text_box is None:
+        print("scale_text_box 为 None，无法 OCR")
+        return None
+
+    x1, y1, x2, y2 = text_box
+    # 稍微多切一点边缘 (Padding)，防止字被切断
+    pad = 5
+    h, w = image.shape[:2]
+    x1 = max(0, x1 - pad)
+    y1 = max(0, y1 - pad)
+    x2 = min(w, x2 + pad)
+    y2 = min(h, y2 + pad)
+
+    # 裁剪图像
+    crop = image[y1:y2, x1:x2]
+    
+    # 图像预处理：放大2倍，二值化，提高识别率
+    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, crop_bin = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    crop_bin = cv2.cvtColor(crop_bin, cv2.COLOR_GRAY2BGR)
+
+    # debugging: 保存一下裁剪图看看对不对（可选）
+    # cv2.imwrite("../temp_data/debug_crop.jpg", crop_bin)
+
+    # 🔥🔥🔥 核心修改点 🔥🔥🔥
+    # det=False: 不进行检测（因为YOLO已经检测过了），跳过崩溃的模块
+    # cls=False: 不进行方向分类
+    try:
+        result = ocr.ocr(crop_bin, det=False, cls=False)
+    except Exception as e:
+        print(f"PaddleOCR 运行报错: {e}")
+        return None
+
+    # det=False 时，返回格式直接是 [('文本', 置信度), ...]
+    if not result:
+        print("OCR 未识别到文字")
+        return None
+
+    print(f"OCR原始结果: {result}")
+    
+    # 解析结果 (取置信度最高的一条，通常只有一条)
+    # result 结构类似于 [('500um', 0.99), ('其他', 0.8)...]
+    text = ""
+    if isinstance(result[0], tuple):
+        text, conf = result[0]
+    elif isinstance(result[0], list): # 防御性编程
+        text, conf = result[0]
+    else:
+        # 某些版本可能直接返回列表
+        text = str(result[0])
+    
+    text = text.strip()
+    print("最终识别文字:", text)
+
+    # ======== 自动修正规则 ========
+    # 常见误识别修正
+    text = text.replace("u", "μ").replace("µ", "μ").replace("rn", "m").replace("wr", "μm").replace("w", "μ")
+    
+    # 如果结果只有数字 (例如 "200")，强制补上 "μm"
+    if re.fullmatch(r"[\d\.]+", text):
+        text += "μm"
+
+    return text
+# ========== 3️⃣ OCR识别比例尺文字 ==========
+def _recognize_scale_text(image, text_box):
     if text_box is None:
         print("scale_text_box 为 None，无法 OCR")
         return None
@@ -181,4 +246,4 @@ def process_image(image_path):
 # ========== 示例调用 ==========
 if __name__ == "__main__":
     #process_image(r'E:\G_data\畴区\畴区\02-散图\畴区光镜数据20x-2\20250107-26.jpg')
-    process_image('../data/frame/11dd74426e8374ac110c4036c77c09ab_000000000000.jpg')
+    process_image(r'D:\code\bl0116\big_data\cq_data\20x\image\20x-1.png')
