@@ -51,7 +51,7 @@ def detect_scale(image_path, conf_thresh=0.3):
 
 
 def _ensure_output_dir() -> str:
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "."))
     out_dir = os.path.join(repo_root, "temp")
     os.makedirs(out_dir, exist_ok=True)
     return out_dir
@@ -93,7 +93,7 @@ def _annotate_and_save(image, image_path: str, detections, scale_text: str | Non
 
     out_dir = _ensure_output_dir()
     stem = os.path.splitext(os.path.basename(image_path))[0]
-    out_path = os.path.join(out_dir, f"{stem}_annotated.jpg")
+    out_path = os.path.join(out_dir, f"{stem}_scale_bar.jpg")
     cv2.imwrite(out_path, annotated)
     print(f"✅ 标注结果已保存: {out_path}")
     return out_path
