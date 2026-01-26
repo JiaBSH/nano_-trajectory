@@ -254,16 +254,54 @@ def parse_scale_text(text):
     s = s.replace("µ", "μ")
     s = s.replace("㎛", "μm")
     s = s.replace("rn", "m")
-    # 去掉常见分隔符（OCR 可能输出 1,000 或 1，000）
-    s = s.replace(",", "").replace("，", "")
-    # 把 'um' / 'u m' 统一成 'μm'
-    s = re.sub(r"(?i)u\s*m", "μm", s)
+    # 统一全角逗号
+    s = s.replace("，", ",")
+    # 把单位里的 'um' / 'u m' / 'uum' 等统一成 'μm'
+    # 注意：这里先处理单位，避免后续数字解析误伤
+    s = re.sub(r"(?i)u+\s*m", "μm", s)
     # 去掉多余空白
     s = re.sub(r"\s+", "", s)
 
+    def _normalize_number_token(token: str) -> str:
+        """将 '10,0' -> '10.0'，'1,000' -> '1000'，'1.000,5' -> '1000.5' 等统一成可 float 的形式。"""
+        t = token
+        if "," in t and "." in t:
+            # 同时存在 , 和 .：以最后出现的分隔符作为小数点，另一个视为千分位
+            last_comma = t.rfind(",")
+            last_dot = t.rfind(".")
+            if last_comma > last_dot:
+                # , 是小数点：去掉千分位 '.'，把 ',' -> '.'
+                t = t.replace(".", "")
+                t = t.replace(",", ".")
+            else:
+                # . 是小数点：去掉千分位 ','
+                t = t.replace(",", "")
+            return t
+
+        if "," in t and "." not in t:
+            # 只有逗号：可能是小数逗号，也可能是千分位
+            # 千分位判断：逗号后面紧跟 3 位数字并结束/非数字
+            if re.search(r"\d,\d{3}(\D|$)", t):
+                return t.replace(",", "")
+            # 其他情况视为小数点
+            return t.replace(",", ".")
+
+        if "." in t and "," not in t:
+            return t
+
+        return t
+
     # 如果只有数字（含小数），默认单位 μm
-    if re.fullmatch(r"\d+(?:\.\d+)?", s):
-        s = f"{s}μm"
+    if re.fullmatch(r"\d+(?:[\.,]\d+)?", s):
+        s = f"{_normalize_number_token(s)}μm"
+    else:
+        # 如果是“数字+单位”，先把数字部分的分隔符归一化
+        # 例如：10,0μm / 1,000um / 1.000,5nm
+        s = re.sub(
+            r"^(?P<num>\d+(?:[\.,]\d+)*)(?P<rest>.*)$",
+            lambda m: _normalize_number_token(m.group("num")) + m.group("rest"),
+            s,
+        )
 
     print(f"解析比例尺原始文字: {raw} -> {s}")
 
