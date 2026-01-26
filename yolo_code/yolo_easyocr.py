@@ -131,62 +131,168 @@ def recognize_scale_text(image, text_box):
     y2 = min(h, y2 + pad)
 
     crop = image[y1:y2, x1:x2]
-    
-    # 图像增强：放大2倍，二值化 (这对 EasyOCR 也很重要)
-    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    _, crop_bin = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
-    # EasyOCR 可以直接吃 numpy 数组
-    try:
-        # allowlist: 只允许识别数字和常见单位字母，排除干扰
-        result = reader.readtext(crop_bin, allowlist='0123456789umNMnm. ')
-    except Exception as e:
-        print(f"❌ EasyOCR 报错: {e}")
+
+    if crop.size == 0:
+        print("⚠️ OCR 裁剪区域为空")
         return None
 
-    if not result:
-        print("⚠️ OCR 未识别到文字")
-        return None
+    # 图像增强：放大、灰度、阈值/自适应阈值、反相，多路尝试提高数字识别成功率
+    crop_up = cv2.resize(crop, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(crop_up, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    print(f"EasyOCR 原始结果: {result}")
-    
-    # EasyOCR 返回格式: [([[x,y]..], 'text', conf), ...]
-    # 我们取置信度最高的一个
-    best_result = sorted(result, key=lambda x: x[2], reverse=True)[0]
-    text = best_result[1].strip()
-    print("最终识别文字:", text)
+    _, bin_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bin_otsu_inv = cv2.bitwise_not(bin_otsu)
+    bin_adapt = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        5,
+    )
+    bin_adapt_inv = cv2.bitwise_not(bin_adapt)
 
-    return text
+    variants = [
+        ("bgr", crop_up),
+        ("gray", gray),
+        ("otsu", bin_otsu),
+        ("otsu_inv", bin_otsu_inv),
+        ("adapt", bin_adapt),
+        ("adapt_inv", bin_adapt_inv),
+    ]
+
+    digits_allow = "0123456789.,"
+    unit_allow = "μµ㎛uUmMnN"
+    full_allow = digits_allow + unit_allow + " "
+
+    def _run_readtext(img, allow: str):
+        try:
+            return reader.readtext(img, allowlist=allow)
+        except Exception as e:
+            print(f"❌ EasyOCR 报错({allow=}): {e}")
+            return []
+
+    def _pick_best(items, prefer_digits: bool):
+        # items: list of (bbox, text, conf)
+        best = None
+        best_score = -1.0
+        for (_bbox, txt, conf) in items or []:
+            t = (txt or "").strip()
+            if not t:
+                continue
+            digit_count = len(re.findall(r"\d", t))
+            has_unit = bool(re.search(r"(?i)(nm|mm|μm|um|μ|µ)", t))
+            # prefer_digits 时，数字数量权重更高
+            score = (digit_count * (50 if prefer_digits else 10)) + (5 if has_unit else 0) + float(conf)
+            if score > best_score:
+                best_score = score
+                best = (t, float(conf), digit_count, has_unit)
+        return best
+
+    best_number = None  # (text, conf, digit_count, has_unit)
+    best_unit = None
+    best_full = None
+
+    for name, img_var in variants:
+        # 1) 数字优先：尽量抓到 1000 / 500 / 200 等
+        r_num = _run_readtext(img_var, allow=digits_allow)
+        if r_num:
+            pick = _pick_best(r_num, prefer_digits=True)
+            if pick and (best_number is None or pick[2] > best_number[2] or (pick[2] == best_number[2] and pick[1] > best_number[1])):
+                best_number = pick
+
+        # 2) 单位优先：抓到 μm / nm / mm
+        r_unit = _run_readtext(img_var, allow=unit_allow)
+        if r_unit:
+            pick = _pick_best(r_unit, prefer_digits=False)
+            if pick and (best_unit is None or pick[1] > best_unit[1]):
+                best_unit = pick
+
+        # 3) 全量：备用（数字+单位一起）
+        r_full = _run_readtext(img_var, allow=full_allow)
+        if r_full:
+            pick = _pick_best(r_full, prefer_digits=True)
+            if pick and (best_full is None or pick[2] > best_full[2] or (pick[2] == best_full[2] and pick[1] > best_full[1])):
+                best_full = pick
+
+        if (best_full and best_full[2] >= 2) or (best_number and best_number[2] >= 2 and best_unit):
+            # 已经有较可靠的数字了，提前结束
+            break
+
+    # 组合策略：有数字 + 有单位则拼起来；否则退回 best_full 或 best_number
+    chosen = None
+    if best_number and best_unit:
+        num_txt = best_number[0]
+        unit_txt = best_unit[0]
+        chosen = f"{num_txt}{unit_txt}"
+        print(f"最终识别文字(数字+单位组合): {chosen}")
+        return chosen
+
+    if best_full:
+        chosen = best_full[0]
+        print(f"最终识别文字(全量最优): {chosen}")
+        return chosen
+
+    if best_number:
+        chosen = best_number[0]
+        print(f"最终识别文字(仅数字): {chosen}")
+        return chosen
+
+    print("⚠️ OCR 未识别到有效文字")
+    return None
 
 # ========== 4️⃣ 解析数值和单位 ==========
 def parse_scale_text(text):
-    if not text: return None, None
-    
-    # 自动修正规则
-    text = text.replace("u", "μ").replace("µ", "μ").replace("rn", "m")
-    
-    # 如果只有数字，强制补 μm
-    if re.fullmatch(r"[\d\.]+", text):
-        text += "μm"
-        
-    print(f"解析比例尺原始文字: {text}")
-
-    # 提取数值和单位
-    match = re.search(r"([\d\.]+)\s*([a-zA-Zμ]+)?", text)
-    if match:
-        value = float(match.group(1))
-        unit = match.group(2) if match.group(2) else "μm"
-        # 统一单位写法
-        if "nm" in unit.lower(): unit = "nm"
-        elif "mm" in unit.lower(): unit = "mm"
-        else: unit = "μm"
-            
-        print(f"✅ 解析结果: 数值={value}, 单位={unit}")
-        return value, unit
-    else:
-        print(f"❌ 无法解析文字为数值单位: {text}")
+    if not text:
         return None, None
+
+    raw = str(text).strip()
+
+    # 归一化：处理多种微米写法、空格、逗号、常见误识别
+    s = raw
+    s = s.replace("µ", "μ")
+    s = s.replace("㎛", "μm")
+    s = s.replace("rn", "m")
+    # 去掉常见分隔符（OCR 可能输出 1,000 或 1，000）
+    s = s.replace(",", "").replace("，", "")
+    # 把 'um' / 'u m' 统一成 'μm'
+    s = re.sub(r"(?i)u\s*m", "μm", s)
+    # 去掉多余空白
+    s = re.sub(r"\s+", "", s)
+
+    # 如果只有数字（含小数），默认单位 μm
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        s = f"{s}μm"
+
+    print(f"解析比例尺原始文字: {raw} -> {s}")
+
+    # 提取：数值 + 单位（支持 nm / μm / mm / um）
+    m = re.search(r"(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>nm|mm|μm|um)?", s, flags=re.IGNORECASE)
+    if not m:
+        print(f"❌ 无法解析文字为数值单位: {raw}")
+        return None, None
+
+    value_str = m.group("value")
+    unit_str = m.group("unit") or "μm"
+
+    try:
+        value = float(value_str)
+    except Exception:
+        print(f"❌ 数值转换失败: {value_str} (raw={raw})")
+        return None, None
+
+    unit_lower = unit_str.lower()
+    if unit_lower == "nm":
+        unit = "nm"
+    elif unit_lower == "mm":
+        unit = "mm"
+    else:
+        # 包括 μm / um
+        unit = "μm"
+
+    print(f"✅ 解析结果: 数值={value}, 单位={unit}")
+    return value, unit
 
 # ========== 5️⃣ 计算比例（μm/pixel） ==========
 def compute_scale_ratio(scale_bar_box, scale_value):

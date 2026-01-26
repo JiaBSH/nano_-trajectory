@@ -1,0 +1,225 @@
+{
+  "created_at": "2026-01-26T17:02:23",
+  "input_dir": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image",
+  "out_dir": "./temp/100x",
+  "count": 7,
+  "results": [
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-1.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-1_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 360.90164865237176,
+      "ratio": 0.027708379934922978,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9553051590919495,
+          "xyxy": [
+            4279,
+            3055,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8902623057365417,
+          "xyxy": [
+            4226,
+            3146,
+            4585,
+            3183
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-2.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-2_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 356.9229608753127,
+      "ratio": 0.028017250488666084,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9546390175819397,
+          "xyxy": [
+            4280,
+            3056,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8992345333099365,
+          "xyxy": [
+            4226,
+            3146,
+            4581,
+            3183
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-3.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-3_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 357.9175882797603,
+      "ratio": 0.027939392551403947,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9570081233978271,
+          "xyxy": [
+            4280,
+            3056,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8885175585746765,
+          "xyxy": [
+            4225,
+            3146,
+            4581,
+            3183
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-4.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-4_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 357.02801010564986,
+      "ratio": 0.028009006904082548,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9553158283233643,
+          "xyxy": [
+            4279,
+            3056,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8960409164428711,
+          "xyxy": [
+            4225,
+            3146,
+            4580,
+            3184
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-5.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-5_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 357.02801010564986,
+      "ratio": 0.028009006904082548,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9524296522140503,
+          "xyxy": [
+            4280,
+            3055,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8862038254737854,
+          "xyxy": [
+            4227,
+            3146,
+            4582,
+            3184
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-6.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-6_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 354.93379664382485,
+      "ratio": 0.028174268256665833,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9545721411705017,
+          "xyxy": [
+            4280,
+            3055,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.899749755859375,
+          "xyxy": [
+            4225,
+            3146,
+            4578,
+            3183
+          ]
+        }
+      ],
+      "error": null
+    },
+    {
+      "image": "D:\\code\\bl0116\\big_data\\cq_data\\100x\\image\\100x-7.png",
+      "annotated_image": "./temp/100x\\annotated\\100x-7_scale_bar.jpg",
+      "scale_value": 10.0,
+      "unit": "μm",
+      "pixel_length": 355.92836357896516,
+      "ratio": 0.0280955411910617,
+      "detections": [
+        {
+          "label": "scale_text",
+          "conf": 0.9565653204917908,
+          "xyxy": [
+            4280,
+            3055,
+            4534,
+            3142
+          ]
+        },
+        {
+          "label": "scale_bar",
+          "conf": 0.8913002610206604,
+          "xyxy": [
+            4226,
+            3146,
+            4580,
+            3183
+          ]
+        }
+      ],
+      "error": null
+    }
+  ]
+}
