@@ -1,11 +1,11 @@
 from ultralytics import YOLO
 if __name__ == "__main__":
     # 加载预训练模型（YOLOv8n）
-    model = YOLO("/home/bingxing2/home/scx9878/JiaBSH/cq_instance_post/yolo_code/yolov8n.pt")
+    model = YOLO("./yolov8n.pt")
 
     # 训练
     model.train(
-        data="/home/bingxing2/home/scx9878/JiaBSH/cq_instance_post/data.yaml",
+        data="./data.yaml",
         epochs=80,
         imgsz=2048,
         batch=4,

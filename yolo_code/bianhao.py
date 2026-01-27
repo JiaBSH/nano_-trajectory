@@ -2,7 +2,7 @@ import glob
 import os
 
 # 标签文件目录（修改为你自己的路径）
-label_dir = r"C:\Users\Keepself\OneDrive\桌面\grahpene\cq_instance_post\big_data\yolo_dataset\labels\train"
+label_dir = r"D:\code\nanojccode\data\nanoscalebar_dataset\labels\val"
 
 
 
@@ -30,10 +30,10 @@ for f in label_files:
             print(f"⚠️ 无法解析类别: {line} in {f}")
             continue
 
-        if cls == 4:
+        if cls == 1:
             parts[0] = "0"
             changed = True
-        elif cls == 5:
+        elif cls == 2:
             parts[0] = "1"
             changed = True
 
