@@ -927,6 +927,111 @@ class GasTracker:
     # Alias for naming preference
     def plot_speed_trajectories(self, *args, **kwargs):
         return self.plot_velocity_trajectories(*args, **kwargs)
+
+    def plot_area_delta_vs_frame(
+        self,
+        outname=None,
+        out_csv=None,
+        per_frame=True,
+        reducer="sum",
+    ):
+        """Plot per-frame change in area (Δarea) as a single curve.
+
+        This is computed from `self.area_records` by first aggregating all detections within
+        the same frame (default: sum), then taking a first-order difference between
+        consecutive frames.
+
+        Args:
+            outname: Output PNG name.
+            out_csv: Optional CSV output for the delta series.
+            per_frame: If True, normalize by delta_frame (handles skipped frames).
+            reducer: How to aggregate multiple objects in the same frame: 'sum' or 'mean'.
+        """
+        if len(self.area_records) == 0:
+            print("No area records to plot area delta.")
+            return
+
+        from collections import defaultdict
+
+        reducer_key = str(reducer).strip().lower()
+        if reducer_key not in {"sum", "mean"}:
+            raise ValueError(f"reducer must be 'sum' or 'mean', got {reducer}")
+
+        areas_by_frame = defaultdict(list)  # frame_id -> list[area_nm2]
+        name_by_frame = {}
+        for frame_id, frame_name, _nm_per_px, area_nm2 in self.area_records:
+            fid = int(frame_id)
+            areas_by_frame[fid].append(float(area_nm2))
+            if fid not in name_by_frame:
+                name_by_frame[fid] = str(frame_name)
+
+        frame_ids = sorted(areas_by_frame.keys())
+        if len(frame_ids) < 2:
+            print("Not enough frames to compute area delta (need >= 2).")
+            return
+
+        area_series = []  # (frame_id, frame_name, area_agg_nm2)
+        for fid in frame_ids:
+            vals = areas_by_frame[fid]
+            if len(vals) == 0:
+                continue
+            if reducer_key == "mean":
+                a = float(np.mean(vals))
+            else:
+                a = float(np.sum(vals))
+            area_series.append((int(fid), name_by_frame.get(int(fid), str(fid)), a))
+
+        # ensure sorted
+        area_series.sort(key=lambda t: int(t[0]))
+
+        # delta aligned to current frame
+        delta_points = []  # (frame_id, frame_name, delta_area_nm2_per_frame)
+        prev_f, _prev_name, prev_a = area_series[0]
+        for cur_f, cur_name, cur_a in area_series[1:]:
+            df = int(cur_f) - int(prev_f)
+            if df <= 0:
+                prev_f, prev_a = cur_f, cur_a
+                continue
+            da = float(cur_a) - float(prev_a)
+            if bool(per_frame):
+                da = da / float(df)
+            delta_points.append((int(cur_f), str(cur_name), float(da)))
+            prev_f, prev_a = cur_f, cur_a
+
+        if len(delta_points) == 0:
+            print("Area delta series is empty after processing.")
+            return
+
+        if outname is None:
+            outname = f"{self.gas_category}_area_delta_vs_frame.png"
+        if out_csv is None:
+            out_csv = f"{self.gas_category}_area_delta_vs_frame.csv"
+
+        frames = np.array([p[0] for p in delta_points], dtype=np.int32)
+        deltas = np.array([p[2] for p in delta_points], dtype=np.float64)
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(frames, deltas, color="#1f77b4", linewidth=1.6)
+        ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
+        ax.set_xlabel("Frame id")
+        ylab = "ΔArea (nm^2/frame)" if bool(per_frame) else "ΔArea (nm^2)"
+        ax.set_ylabel(ylab)
+        ax.grid(True, alpha=0.25)
+
+        agg_label = "sum" if reducer_key == "sum" else "mean"
+        ax.set_title(f"{self.gas_category}: per-frame area change (Δarea), frame-agg={agg_label}", loc="center")
+
+        plt.tight_layout()
+        plt.savefig(outname, dpi=300, bbox_inches="tight")
+        print(f"Saved area delta plot: {outname}")
+
+        # export delta CSV
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_id", "frame_name", "delta_area_nm2_per_frame" if bool(per_frame) else "delta_area_nm2"])
+            for fid, fname, da in delta_points:
+                writer.writerow([int(fid), str(fname), f"{float(da):.6f}"])
+        print(f" - {out_csv}")
     # -----------------------------
     # 可视化（抽帧）
     # -----------------------------
@@ -1107,6 +1212,7 @@ if __name__ == "__main__":
     tracker.export_results()
     tracker.plot_evolution(step=20)
     tracker.plot_centroid_trajectories(max_dist=50)
-    tracker.plot_area_trajectories(max_dist=500, min_track_length=5)
+    tracker.plot_area_trajectories(max_dist=50, min_track_length=2)
+    tracker.plot_area_delta_vs_frame(per_frame=True, reducer="sum")
     # 30 fps => 1/30 s per frame; speed unit: nm/s
     tracker.plot_velocity_trajectories(max_dist=50, min_track_length=2, frame_interval_s=1/30, bin_size_frames=1)
