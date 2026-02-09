@@ -1,0 +1,66 @@
+NanoJC 数据结果说明（gas / nanocluster / nanodroplet）
+说明：本文件对三个目录内的 CSV 表格与 PNG 图像做简要说明，并列出各 CSV 的表头字段。
+
+字段解释
+- frame_id：帧序号/帧编号（从0开始）
+- delta_area_nm2_per_frame：相邻帧之间的面积变化量（单位：nm^2/帧；正增大、负减小）
+- nm_per_pixel：尺度换算系数：每个像素对应的真实长度（单位：nm/pixel）
+- area_nm2：面积（单位：nm^2）
+- cx_nm：质心 x 坐标（单位：nm）
+- cy_nm：质心 y 坐标（单位：nm）
+- contour_points_nm：轮廓点集（单位：nm；(x,y) 点序列，描述边界）
+- diameter_nm：等效直径（单位：nm；）
+- height_nm：高度/厚度（单位：nm；）
+- instance_id：实例编号（跨帧跟踪的目标ID）
+- speed_nm_per_s：速度（单位：nm/s；质心位移速度）
+
+====================
+文件夹：gas/
+====================
+一、CSV 表格（数据文件）
+- 文件：gas/gas_area_delta_vs_frame.csv
+  含义：相邻帧的面积变化量
+  表头字段：frame_id, frame_name, delta_area_nm2_per_frame
+  示例首行：1, 11dd74426e8374ac110c4036c77c09ab_000000000001, -57.731959
+
+- 文件：gas/gas_area_vs_frame.csv
+  含义：按帧统计的目标总面积
+  表头字段：frame_id, frame_name, nm_per_pixel, area_nm2
+  示例首行：0, 11dd74426e8374ac110c4036c77c09ab_000000000000, 0.398252, 8078.033307
+
+- 文件：gas/gas_centroids.csv
+  含义：目标质心坐标
+  表头字段：frame_id, frame_name, nm_per_pixel, cx_nm, cy_nm
+  示例首行：0, 11dd74426e8374ac110c4036c77c09ab_000000000000, 0.398252, 306.124217, 193.854718
+
+- 文件：gas/gas_contours_by_frame.csv
+  含义：按帧保存的轮廓信息
+  表头字段：frame_id, frame_name, contour_points_nm
+  示例首行：0, 11dd74426e8374ac110c4036c77c09ab_000000000000, (269.644,154.084), (272.587,153.940), (276.227,154.924), (278.888,155.625), (280.289,160.527), (281.831,165.147), (284.352,168.791), (286.454,171.451) ...
+
+- 文件：gas/gas_instance_area_vs_frame.csv
+  含义：按实例统计的目标总面积
+  表头字段：instance_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
+  示例首行：1, 0, 11dd74426e8374ac110c4036c77c09ab_000000000000, 0.398252, 8078.033307, 306.124217, 193.854718
+
+- 文件：gas/gas_instance_speed_vs_frame.csv
+  含义：按实例统计的位移速度
+  表头字段：instance_id, frame_id, frame_name, speed_nm_per_s
+  示例首行：1, 1, 11dd74426e8374ac110c4036c77c09ab_000000000001, 675.235885
+
+二、PNG 图像（可视化结果）
+- 文件：gas/gas_area_delta_vs_frame.png
+  含义：面积变化量图
+- 文件：gas/gas_area_trajectories.png
+  含义：面积演化图
+- 文件：gas/gas_centroid_trajectories.png
+  含义：质心轨迹图
+- 文件：gas/gas_evolution.png
+  含义：演化总览图
+- 文件：gas/gas_velocity_trajectories.png
+  含义：速度轨迹图
+
+====================
+nanocluster文件夹的内容与gas文件夹的内容格式一致
+nanodroplet文件夹中多一个nanodroplet_diameter_height_vs_frame.csv和一个子文件夹标注液滴底部直径和高度，目前部分帧底部直径和高度识别不准。
+====================
