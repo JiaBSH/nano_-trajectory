@@ -179,262 +179,291 @@ class GasTracker:
     @staticmethod
     def _compute_droplet_dims_oriented(pts):
         """
-        Compute diameter and height assuming the droplet is a semi-circle projected onto 2D.
-        The "base" of the semi-circle is the diameter.
-        We find the best-fit bounding box (Minimum Area Rectangle might be too strict if there's noise).
-        
-        Strategy:
-        1. Compute Convex Hull to simplify geometry.
-        2. "Bottom" is likely significantly flatter (less curvature) than the "dome".
-           OR: The Minimum Area Rectangle's longer side is often the diameter for low contact angles,
-           but for high contact angles (>90 deg), the height might be larger than diameter?
-           
-           Actually, sessile droplets (liquid on solid) generally have a flat contact line.
-           This contact line corresponds to one of the sides of the bounding limits.
-           
-           Let's iterate over all edges of the Convex Hull.
-           The edge that is "longest" or creates a bounding box with minimum area is a good candidate.
-           However, a fragmented straight line might not be the single longest edge.
-           
-           Robust Approach:
-           - Iterate all edges of the convex hull.
-           - Consider the line passing through the edge.
-           - Project all points onto this line (width) and perpendicular (height).
-           - Metric to maximize: "Linearity" of the points along one side?
-           
-           Let's stick to the classic "Minimum Area Rectangle" assumption:
-           The flat base corresponds to one side of the MAR.
-           
-           We calculate MAR. It gives us a rectangle with width W and height H and angle theta.
-           We need to decide which side is Diameter and which is Height.
-           - The "Base" contains the actual contact line.
-           - The contact line usually has a high density of points lying very close to the MAR edge.
-           
+        Compute droplet diameter/height from a fitted contact line on the original contour.
+
+        The previous convex-hull heuristic often picked a chord on the dome rather than the
+        actual contact line, which made the fitted rectangle drift. This version searches for
+        the longest nearly straight contiguous contour segment that also acts as a supporting
+        line for the rest of the droplet, then measures height as the farthest inward point.
+
         Returns:
             diameter (float)
             height (float)
             box_info (dict): {
-                'box_points': [(x,y)...], # 4 corners of the bounding box
                 'baseline_p1': (x,y),
                 'baseline_p2': (x,y),
-                'apex_point': (x,y)
+                'apex_point': (x,y),
+                'base_mid_point': (x,y),
+                'corners': [(x,y), ...]
             }
         """
         if pts.shape[0] < 3:
             return 0.0, 0.0, None
 
+        def fit_circle_kasa(x_vals, y_vals):
+            """Kasa algebraic circle fit with proper data centering for numerical stability."""
+            x = np.asarray(x_vals, dtype=np.float64)
+            y = np.asarray(y_vals, dtype=np.float64)
+            n = len(x)
+            if n < 3:
+                return None
+            xm, ym = x.mean(), y.mean()
+            u = x - xm
+            v = y - ym
+            Suu = np.dot(u, u)
+            Svv = np.dot(v, v)
+            Suv = np.dot(u, v)
+            A = np.array([[Suu, Suv], [Suv, Svv]])
+            b_vec = np.array([
+                0.5 * (np.dot(u, u * u) + np.dot(u, v * v)),
+                0.5 * (np.dot(v, v * v) + np.dot(v, u * u)),
+            ])
+            try:
+                uc, vc = np.linalg.solve(A, b_vec)
+            except np.linalg.LinAlgError:
+                return None
+            cx = xm + uc
+            cy = ym + vc
+            r_sq = uc * uc + vc * vc + (Suu + Svv) / n
+            if r_sq <= 0:
+                return None
+            r = float(np.sqrt(r_sq))
+            resid = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) - r
+            rms = float(np.sqrt(np.mean(resid ** 2))) if resid.size > 0 else 0.0
+            return float(cx), float(cy), r, rms
+
+        def fit_spherical_cap_1d(x_dome, y_dome, half_span):
+            """
+            Constrained spherical-cap fit for a sessile droplet.
+
+            The center is fixed on the perpendicular bisector of the contact span
+            (cx = 0 in local frame), so only cy is optimised.  The contact radius
+            a = half_span fixes the sphere radius once cy is known:
+                R = sqrt(a^2 + cy^2)
+            Height of the cap above the baseline:
+                h = cy + R
+
+            This 1-D optimisation is much more robust than an unconstrained 3-D
+            algebraic fit and is the physically correct model for a sessile droplet.
+
+            Returns (cy, radius, rms) or None.
+            """
+            from scipy.optimize import minimize_scalar
+            x = np.asarray(x_dome, dtype=np.float64)
+            y = np.asarray(y_dome, dtype=np.float64)
+            if len(x) < 3 or half_span <= 0:
+                return None
+
+            def cost(cy_val):
+                r_val = np.sqrt(half_span * half_span + cy_val * cy_val)
+                dists = np.sqrt(x * x + (y - cy_val) ** 2)
+                return float(np.sum((dists - r_val) ** 2))
+
+            # Initial estimate from apex height via spherical-cap geometry:
+            # h = cy + R, R^2 = a^2 + cy^2  =>  cy = (h^2 - a^2) / (2*h)
+            h_est = float(np.max(y)) if y.size > 0 else half_span
+            a = half_span
+            cy_init = (h_est * h_est - a * a) / (2.0 * h_est) if h_est > 1e-6 else 0.0
+            lo = cy_init - 2.0 * a
+            hi = cy_init + 2.0 * a
+
+            try:
+                opt = minimize_scalar(cost, bounds=(lo, hi), method='bounded',
+                                      options={'xatol': 1e-4, 'maxiter': 300})
+                cy = float(opt.x)
+            except Exception:
+                cy = cy_init
+
+            r = float(np.sqrt(a * a + cy * cy))
+            resid = np.sqrt(x * x + (y - cy) ** 2) - r
+            rms = float(np.sqrt(np.mean(resid ** 2))) if resid.size > 0 else 0.0
+            return cy, r, rms
+
+        pts = np.asarray(pts, dtype=np.float64)
+        n_pts = int(pts.shape[0])
+        if n_pts < 3:
+            return 0.0, 0.0, None
+
+        bbox_min = np.min(pts, axis=0)
+        bbox_max = np.max(pts, axis=0)
+        diag = float(np.linalg.norm(bbox_max - bbox_min))
+        if diag <= 1e-6:
+            return 0.0, 0.0, None
+
+        # ---- Convex-hull chord sweep for contact baseline ----
+        #
+        # The contact line of a sessile droplet is the longest chord that:
+        #   (a) acts as an approximate supporting line (all points on one side), and
+        #   (b) yields H <= D (physical constraint for any spherical cap).
+        #
+        # We iterate over all pairs of convex-hull vertices.  A typical hull has
+        # 8-20 vertices, so this is O(n_hull^2) ~ a few hundred iterations at most.
         from scipy.spatial import ConvexHull
         try:
             hull = ConvexHull(pts)
+            hull_verts = pts[hull.vertices]
         except Exception:
-            return 0.0, 0.0, None
-            
-        hull_points = pts[hull.vertices]
-        num_hull = len(hull_points)
-        
-        best_metric = float('inf') # We want to minimize volume, or maximize "points on edge"
-        best_rect_params = None # (width, height, angle, min_u, min_v, edge_idx)
-        
-        # Create edges to test
-        # Edges of the convex hull are the candidates for the orientation of the bounding box
-        edges = hull_points - np.roll(hull_points, 1, axis=0)
-        angles = np.arctan2(edges[:, 1], edges[:, 0])
-        
-        # We will check each edge of the hull as a candidate for the direction of the "flat base".
-        results = []
-        
-        target_angle = np.radians(20) # User specified: ~30 degrees clockwise
-        
-        for i, angle in enumerate(angles):
-            # Rotation matrix to align this edge with X-axis
-            c, s = np.cos(-angle), np.sin(-angle)
-            R = np.array([[c, -s], [s, c]])
-            
-            rot_pts = np.dot(pts, R.T)
-            
-            min_u = np.min(rot_pts[:, 0])
-            max_u = np.max(rot_pts[:, 0])
-            min_v = np.min(rot_pts[:, 1])
-            max_v = np.max(rot_pts[:, 1])
-            
-            width = max_u - min_u
-            height = max_v - min_v
-            area = width * height
-            
-            # Metric: "Closeness to edge".
-            # For the correct base, many points (the flat bottom) should be at min_v or max_v.
-            # Let's count points within a small epsilon of min_v or max_v.
-            tol = height * 0.05 # 5% tolerance
-            
-            pts_near_bottom = np.sum(rot_pts[:, 1] < (min_v + tol))
-            pts_near_top = np.sum(rot_pts[:, 1] > (max_v - tol))
-            
-            # The base should have MORE points close to it than the apex (which is just a tip).
-            base_is_min_v = False
-            base_score = 0
-            
-            if pts_near_bottom > pts_near_top:
-                base_score = pts_near_bottom
-                base_is_min_v = True
-            else:
-                base_score = pts_near_top
-                base_is_min_v = False
-                
-            # Angle deviation calculation (modulo pi for line orientation)
-            # Shortest angular distance to target_angle
-            angle_diff = np.abs(np.arctan2(np.sin(angle - target_angle), np.cos(angle - target_angle)))
-            # Since line orientation is symmetric (theta == theta + pi), we want distance to line
-            # actually hull edges are vectors. A generic line has range [0, pi).
-            # The edge vector angle matches the line angle.
-            # But the baseline could be the vector (A->B) or (B->A).
-            # If B->A, angle is angle + pi.
-            # We want min distance to 30 deg OR (30 + 180) deg.
-            angle_diff = min(angle_diff, np.abs(np.pi - angle_diff))
-            
-            # Penalty factor:
-            # If diff is 0, factor = 1.0.
-            # If diff is 90 deg (pi/2), factor = MIN_FACTOR (e.g. 0.3)
-            # Let's say we heavily penalize perpendicular angles.
-            # weighted_score = base_score * (1.0 - 0.7 * (angle_diff / (np.pi/2)))
-            weight = 1.0 - 0.7 * (angle_diff / (np.pi / 2))
-            weighted_score = base_score * weight
-                
-            results.append({
-                'width': width,
-                'height': height,
-                'area': area,
-                'angle': angle,
-                'base_score': base_score,
-                'weighted_score': weighted_score,
-                'angle_diff': angle_diff,
-                'base_is_min_v': base_is_min_v,
-                'min_u': min_u, 'max_u': max_u,
-                'min_v': min_v, 'max_v': max_v
-            })
+            hull_verts = pts
 
-        # Selection Strategy:
-        # Sort by weighted_score descending
-        results.sort(key=lambda x: x['weighted_score'], reverse=True)
-        
-        # Check if the best score is significantly better than others or if simple Min Area is safer?
-        # Let's use a hybrid: Filter for "good" rectangles (low area) then pick max score?
-        # Actually, "Max Points on Edge" is very robust for "Flat Line detection".
-        best = results[0]
-        
-        # Reconstruct geometry in original frame
-        # We need the baseline endpoints and apex.
-        
-        angle = best['angle']
-        min_u, max_u = best['min_u'], best['max_u']
-        min_v, max_v = best['min_v'], best['max_v']
-        
-        c, s = np.cos(angle), np.sin(angle)
-        # Inverse rotation (R^-1 = R^T)
-        # R was [[c, -s], [s, c]] (rotation by -angle)
-        # We want to map BACK to world.
-        # World = Rot * R_inv? 
-        # Rot = World * R^T  ==> World = Rot * (R^T)^-1 = Rot * R
-        # R_mat for mapping Rot -> World is rotation by +angle
-        
-        R_back = np.array([[c, -s], [s, c]]) # Wait: c=cos(ang), s=sin(angle). This is rot by angle.
-        
-        # Corners in rotated space
-        # Box is (min_u, min_v) to (max_u, max_v)
-        
-        # Identify Baseline in rotated space
-        if best['base_is_min_v']:
-            # Baseline is segment at v = min_v, from u=min_u to max_u
-            base_u1, base_v1 = min_u, min_v
-            base_u2, base_v2 = max_u, min_v
-            
-            # Apex is somewhere on v = max_v
-            # Let's pick the midpoint of the top edge projected or the actual point with max V?
-            # Height is just max_v - min_v
-            pass
-        else:
-            # Baseline is segment at v = max_v
-            base_u1, base_v1 = min_u, max_v
-            base_u2, base_v2 = max_u, max_v
-            pass
-            
-        # Transform back
-        p1 = np.dot(np.array([base_u1, base_v1]), R_back.T) # No, just dot(R_back, vec) or vec.dot(R_back)?
-        # rot_pts = np.dot(pts, R.T) -> pts * R_inv
-        # R was [[c, -s], [s, c]] (rot by -angle)
-        # pts = rot_pts * R_inv^T ? 
-        # Let's stick to standard algebra.
-        # u = x cos(-a) - y sin(-a) = x c + y s
-        # v = x sin(-a) + y cos(-a) = -x s + y c
-        #
-        # x = u cos(a) - v sin(a)
-        # y = u sin(a) + v cos(a)
-        # 
-        # So trans matrix T = [[ca, -sa], [sa, ca]]
-        
-        # Actually R above was [[c, -s], [s, c]] for rotation by -angle? 
-        # c=cos(-a) = cos(a), s=sin(-a) = -sin(a).
-        # So my R construction was:
-        # c_val = cos(angle), s_val = sin(angle)
-        # c = c_val, s = -s_val
-        # R = [[c, -s], [s, c]] = [[cos, sin], [-sin, cos]]
-        # This looks like standard rotation matrix for +angle if applied as v' = R v.
-        # But I used c, s = cos(-angle), sin(-angle).
-        # So theta = -angle.
-        # R = [[cos(t), -sin(t)], [sin(t), cos(t)]]
-        # v_rot = R . v_world.
-        
-        # To go back: v_world = R^-1 v_rot = R^T v_rot
-        
-        # Reconstruct Rotation Matrix used
-        ang = -best['angle']
-        c, s = np.cos(ang), np.sin(ang)
-        R = np.array([[c, -s], [s, c]])
-        
-        def to_world(u, v):
-            # v_rot = [u, v]
-            # v_world = R^T . v_rot
-            # v_world = v_rot . R (if row vectors)
-            vec = np.array([u, v])
-            return np.dot(vec, R)
-            
-        base_p1_world = to_world(base_u1, base_v1)
-        base_p2_world = to_world(base_u2, base_v2)
-        
-        # Compute diameter and height
-        diameter = best['width']
-        height = best['height']
-        
-        # Find apex point in world coordinates
-        # Apex is the point maximizing distance from baseline.
-        # In rotated frame, if base is at min_v, apex is at max_v.
-        # We can find the point with max_v in u-range.
-        # Or just return the "Height Line" as per user request (perpendicular from base to top).
-        # For visualization, we simply draw the box or the height line.
-        # Draw height line from midpoint of base to top?
-        
-        mid_u = (base_u1 + base_u2) / 2
-        mid_v = (base_v1 + base_v2) / 2
-        
-        if best['base_is_min_v']:
-            apex_u, apex_v = mid_u, max_v
-        else:
-            apex_u, apex_v = mid_u, min_v
-            
-        apex_world = to_world(apex_u, apex_v)
-        base_mid_world = to_world(mid_u, mid_v) # Midpoint on baseline
-        
-        # Box corners for debug/viz
-        c1 = to_world(min_u, min_v)
-        c2 = to_world(max_u, min_v)
-        c3 = to_world(max_u, max_v)
-        c4 = to_world(min_u, max_v)
-        
+        n_hull = len(hull_verts)
+        outside_tol = max(2.0, diag * 0.025)
+        min_chord = max(8.0, diag * 0.15)
+
+        best = None
+
+        for i in range(n_hull):
+            for j in range(n_hull):
+                if i == j:
+                    continue
+                p1 = hull_verts[i]
+                p2 = hull_verts[j]
+                chord = p2 - p1
+                chord_len = float(np.linalg.norm(chord))
+                if chord_len < min_chord:
+                    continue
+
+                direction = chord / chord_len
+                normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+
+                # Signed distances of all contour pts from the line through p1
+                signed = np.dot(pts - p1, normal)
+
+                # Orient normal so that the majority of pts are on the positive side
+                if np.sum(signed > 0) < np.sum(signed < 0):
+                    normal = -normal
+                    signed = -signed
+
+                # Reject if too many points lie on the wrong side of the line
+                outside_frac = float(np.mean(signed < -outside_tol))
+                if outside_frac > 0.05:
+                    continue
+
+                height = float(np.max(signed))
+                if height <= 1.0:
+                    continue
+
+                # Score = chord length, with strong penalty when H > D
+                hd = height / chord_len
+                score = chord_len
+                if hd > 1.0:
+                    score *= 1.0 / (1.0 + (hd - 1.0) ** 2 * 50.0)
+
+                if best is None or score > best["score"] + 1e-9:
+                    best = {
+                        "score": score,
+                        "p1": p1, "p2": p2,
+                        "direction": direction, "normal": normal,
+                        "signed": signed,
+                        "diameter": chord_len, "height": height,
+                    }
+
+        # ---- Fallback: PCA orientation ----
+        if best is None:
+            centroid = np.mean(pts, axis=0)
+            try:
+                _u, _s, vh = np.linalg.svd(pts - centroid, full_matrices=False)
+                direction = np.asarray(vh[0], dtype=np.float64)
+                direction /= max(float(np.linalg.norm(direction)), 1e-9)
+            except Exception:
+                direction = np.array([1.0, 0.0], dtype=np.float64)
+            normal = np.array([-direction[1], direction[0]], dtype=np.float64)
+            signed = np.dot(pts - centroid, normal)
+            if np.sum(signed > 0) < np.sum(signed < 0):
+                normal = -normal
+                signed = -signed
+            u_all = np.dot(pts - centroid, direction)
+            base_off = float(np.min(signed))
+            signed -= base_off
+            diameter = float(np.max(u_all) - np.min(u_all))
+            height = float(np.max(signed))
+            apex_world = pts[int(np.argmax(signed))]
+            base_p1_world = centroid + direction * float(np.min(u_all)) + normal * base_off
+            base_p2_world = centroid + direction * float(np.max(u_all)) + normal * base_off
+            base_mid_world = 0.5 * (base_p1_world + base_p2_world)
+            c1, c2 = base_p1_world, base_p2_world
+            c3, c4 = c2 + normal * height, c1 + normal * height
+            return diameter, height, {
+                "baseline_p1": c1, "baseline_p2": c2,
+                "apex_point": apex_world, "base_mid_point": base_mid_world,
+                "corners": [c1, c2, c3, c4],
+                "arc_points": None, "fit_center": None, "fit_radius": None,
+            }
+
+        # ---- Extract baseline from best hull chord ----
+        base_p1_world = best["p1"]
+        base_p2_world = best["p2"]
+        direction = best["direction"]
+        normal = best["normal"]
+        signed_all = best["signed"]
+        diameter = best["diameter"]
+        height = best["height"]
+
+        apex_idx = int(np.argmax(signed_all))
+        apex_world = pts[apex_idx]
+        base_mid_world = 0.5 * (base_p1_world + base_p2_world)
+
+        c1, c2 = base_p1_world, base_p2_world
+        c3, c4 = c2 + normal * height, c1 + normal * height
+
+        # ---- Spherical-cap refinement on dome points ----
+        fit_center_world = None
+        fit_radius = None
+
+        baseline_mid = base_mid_world
+        local_x = np.dot(pts - baseline_mid, direction)
+        local_y = np.dot(pts - baseline_mid, normal)
+        dome_mask = local_y > max(0.5, height * 0.03)
+        half_span = diameter / 2.0
+
+        if int(np.sum(dome_mask)) >= 4 and half_span > 1e-6:
+            x_dome = local_x[dome_mask]
+            y_dome = local_y[dome_mask]
+
+            # Primary: constrained spherical-cap (cx = 0)
+            cap_fit = fit_spherical_cap_1d(x_dome, y_dome, half_span)
+            used_constrained = False
+            if cap_fit is not None:
+                fit_cy, fit_r, fit_rms = cap_fit
+                fit_height = float(fit_cy + fit_r)
+                if fit_height > 1.0 and fit_rms <= max(5.0, height * 0.30):
+                    height = float(fit_height)
+                    apex_world = baseline_mid + normal * fit_height
+                    c3 = c2 + normal * height
+                    c4 = c1 + normal * height
+                    fit_center_world = baseline_mid + normal * fit_cy
+                    fit_radius = float(fit_r)
+                    used_constrained = True
+
+            # Fallback: Kasa unconstrained
+            if not used_constrained:
+                kasa = fit_circle_kasa(x_dome, y_dome)
+                if kasa is not None:
+                    fit_cx, fit_cy, fit_r, fit_rms = kasa
+                    discriminant = fit_r * fit_r - fit_cy * fit_cy
+                    if discriminant > 1.0 and fit_rms <= max(5.0, height * 0.30):
+                        half_span_fit = float(np.sqrt(discriminant))
+                        fit_height = float(fit_cy + fit_r)
+                        if fit_height > 1.0:
+                            diameter = float(2.0 * half_span_fit)
+                            height = float(fit_height)
+                            base_p1_world = baseline_mid + direction * float(fit_cx - half_span_fit)
+                            base_p2_world = baseline_mid + direction * float(fit_cx + half_span_fit)
+                            base_mid_world = baseline_mid + direction * float(fit_cx)
+                            apex_world = base_mid_world + normal * fit_height
+                            c1, c2 = base_p1_world, base_p2_world
+                            c3, c4 = c2 + normal * height, c1 + normal * height
+                            fit_center_world = baseline_mid + direction * float(fit_cx) + normal * float(fit_cy)
+                            fit_radius = float(fit_r)
+
         return diameter, height, {
-            'baseline_p1': base_p1_world,
-            'baseline_p2': base_p2_world,
-            'apex_point': apex_world,
-            'base_mid_point': base_mid_world,
-            'corners': [c1, c2, c3, c4]
+            "baseline_p1": base_p1_world,
+            "baseline_p2": base_p2_world,
+            "apex_point": apex_world,
+            "base_mid_point": base_mid_world,
+            "corners": [c1, c2, c3, c4],
+            "arc_points": None,
+            "fit_center": fit_center_world,
+            "fit_radius": fit_radius,
         }
 
     # -----------------------------
@@ -583,43 +612,89 @@ class GasTracker:
     # -----------------------------
     # 数据导出
     # -----------------------------
-    def export_results(self):
+    def _build_export_instance_ids(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        """Build per-record droplet ids aligned with object_records order."""
+        if len(self.object_records) == 0:
+            return []
+
+        from collections import defaultdict
+
+        by_frame = defaultdict(list)
+        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
+            by_frame[int(frame_id)].append((frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2)))
+
+        mode = str(id_mode).strip().lower()
+        if mode != "event":
+            raise NotImplementedError("export_results currently supports id_mode='event' only")
+
+        series_by_id, assigned_ids_by_frame, _events = self._build_event_id_series_with_assignments(
+            by_frame,
+            max_dist=max_dist,
+        )
+
+        if bool(use_display_id):
+            display_id_of = self._display_id_mapping(series_by_id)
+            assigned_ids_by_frame = {
+                int(frame_id): [int(display_id_of.get(int(instance_id), int(instance_id))) for instance_id in ids]
+                for frame_id, ids in assigned_ids_by_frame.items()
+            }
+
+        export_ids = []
+        for frame_id in sorted(assigned_ids_by_frame.keys()):
+            export_ids.extend(assigned_ids_by_frame[frame_id])
+
+        if len(export_ids) != len(self.object_records):
+            raise ValueError(
+                f"Export instance-id count mismatch: ids={len(export_ids)} object_records={len(self.object_records)}"
+            )
+
+        return export_ids
+
+    def export_results(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        export_ids = self._build_export_instance_ids(
+            max_dist=max_dist,
+            id_mode=id_mode,
+            use_display_id=use_display_id,
+        )
+
         # 面积
         path1 = os.path.join(self.output_root, f"{self.gas_category}_area_vs_frame.csv")
         with open(path1, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "area_nm2"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "area_nm2"])
             writer.writerows(
-                [[frame_id, frame_name, f"{nm_per_px:.6f}", f"{area_nm2:.6f}"]
-                 for frame_id, frame_name, nm_per_px, area_nm2 in self.area_records]
+                [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{area_nm2:.6f}"]
+                 for instance_id, (frame_id, frame_name, nm_per_px, area_nm2) in zip(export_ids, self.area_records)]
             )
 
         # 轮廓（每帧一行）
         path2 = os.path.join(self.output_root, f"{self.gas_category}_contours_by_frame.csv")
         with open(path2, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "contour_points_nm"])
-            writer.writerows(self.contour_records)
+            writer.writerow(["instance_id", "frame_id", "frame_name", "contour_points_nm"])
+            writer.writerows(
+                [[int(instance_id)] + row for instance_id, row in zip(export_ids, self.contour_records)]
+            )
 
         # 质心
         path3 = os.path.join(self.output_root, f"{self.gas_category}_centroids.csv")
         with open(path3, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm"])
             writer.writerows(
-                [[frame_id, frame_name, f"{nm_per_px:.6f}", f"{cx_nm:.6f}", f"{cy_nm:.6f}"]
-                 for frame_id, frame_name, nm_per_px, cx_nm, cy_nm in self.centroid_records]
+                [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{cx_nm:.6f}", f"{cy_nm:.6f}"]
+                 for instance_id, (frame_id, frame_name, nm_per_px, cx_nm, cy_nm) in zip(export_ids, self.centroid_records)]
             )
 
         # Diameter and Height
         path4 = os.path.join(self.output_root, f"{self.gas_category}_diameter_height_vs_frame.csv")
         with open(path4, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm", "diameter_nm", "height_nm"])
-            for row in self.diameter_height_records:
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm", "diameter_nm", "height_nm"])
+            for instance_id, row in zip(export_ids, self.diameter_height_records):
                 # row structure: [frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, min_x, min_y, max_x, max_y]
                 # we only export the first 7 fields here
-                writer.writerow([row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}", f"{row[4]:.6f}", f"{row[5]:.6f}", f"{row[6]:.6f}"])
+                writer.writerow([int(instance_id), row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}", f"{row[4]:.6f}", f"{row[5]:.6f}", f"{row[6]:.6f}"])
 
         print("Export finished:")
         print(f" - {path1}")
@@ -774,13 +849,13 @@ class GasTracker:
 
                                 corners = box_info.get("corners")
                                 if corners is not None:
-                                    corners = np.array(corners, dtype=np.float32)
-                                    rect_poly = [tuple(map(float, p)) for p in corners]
+                                    corners_arr = np.array(corners, dtype=np.float32)
+                                    rect_poly = [tuple(map(float, p)) for p in corners_arr]
                                     draw.polygon(rect_poly, outline="cyan", width=2)
 
                                     text = f"D:{d_nm:.1f}\nH:{h_nm:.1f}"
-                                    cx = float(corners[:, 0].mean())
-                                    cy = float(corners[:, 1].mean())
+                                    cx = float(corners_arr[:, 0].mean())
+                                    cy = float(corners_arr[:, 1].mean())
                                     draw.text((cx, cy), text, fill="yellow", font=font)
 
                                 baseline_p1 = box_info.get("baseline_p1")
@@ -1832,19 +1907,19 @@ class GasTracker:
 # ======================
 if __name__ == "__main__":
     tracker = GasTracker(
-        json_dir="./data/defect_label",
-        image_path="./data/color_mask1121/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
+        json_dir="./data/20260508-mark",
+        image_path="./data/20260508-color/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
         scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
+        #output_root="./result/0510",
         scale_value_nm=20.0,
         strict_scale_match=False,
-        gas_category="nanodroplet",
-
+        gas_category="nanocluster",
         pin_category="pin"
     )
     tracker.process_all_frames()
     tracker.export_results()
     # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanodroplet",label_ids=True) 
+    tracker.annotate_images(output_dir="annotated_nanocluster",label_ids=True) 
     tracker.plot_evolution(step=20)
     tracker.plot_centroid_trajectories(max_dist=50)
     tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
