@@ -583,43 +583,89 @@ class GasTracker:
     # -----------------------------
     # 数据导出
     # -----------------------------
-    def export_results(self):
+    def _build_export_instance_ids(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        """Build per-record droplet ids aligned with object_records order."""
+        if len(self.object_records) == 0:
+            return []
+
+        from collections import defaultdict
+
+        by_frame = defaultdict(list)
+        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
+            by_frame[int(frame_id)].append((frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2)))
+
+        mode = str(id_mode).strip().lower()
+        if mode != "event":
+            raise NotImplementedError("export_results currently supports id_mode='event' only")
+
+        series_by_id, assigned_ids_by_frame, _events = self._build_event_id_series_with_assignments(
+            by_frame,
+            max_dist=max_dist,
+        )
+
+        if bool(use_display_id):
+            display_id_of = self._display_id_mapping(series_by_id)
+            assigned_ids_by_frame = {
+                int(frame_id): [int(display_id_of.get(int(instance_id), int(instance_id))) for instance_id in ids]
+                for frame_id, ids in assigned_ids_by_frame.items()
+            }
+
+        export_ids = []
+        for frame_id in sorted(assigned_ids_by_frame.keys()):
+            export_ids.extend(assigned_ids_by_frame[frame_id])
+
+        if len(export_ids) != len(self.object_records):
+            raise ValueError(
+                f"Export instance-id count mismatch: ids={len(export_ids)} object_records={len(self.object_records)}"
+            )
+
+        return export_ids
+
+    def export_results(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        export_ids = self._build_export_instance_ids(
+            max_dist=max_dist,
+            id_mode=id_mode,
+            use_display_id=use_display_id,
+        )
+
         # 面积
         path1 = os.path.join(self.output_root, f"{self.gas_category}_area_vs_frame.csv")
         with open(path1, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "area_nm2"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "area_nm2"])
             writer.writerows(
-                [[frame_id, frame_name, f"{nm_per_px:.6f}", f"{area_nm2:.6f}"]
-                 for frame_id, frame_name, nm_per_px, area_nm2 in self.area_records]
+                [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{area_nm2:.6f}"]
+                 for instance_id, (frame_id, frame_name, nm_per_px, area_nm2) in zip(export_ids, self.area_records)]
             )
 
         # 轮廓（每帧一行）
         path2 = os.path.join(self.output_root, f"{self.gas_category}_contours_by_frame.csv")
         with open(path2, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "contour_points_nm"])
-            writer.writerows(self.contour_records)
+            writer.writerow(["instance_id", "frame_id", "frame_name", "contour_points_nm"])
+            writer.writerows(
+                [[int(instance_id)] + row for instance_id, row in zip(export_ids, self.contour_records)]
+            )
 
         # 质心
         path3 = os.path.join(self.output_root, f"{self.gas_category}_centroids.csv")
         with open(path3, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm"])
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm"])
             writer.writerows(
-                [[frame_id, frame_name, f"{nm_per_px:.6f}", f"{cx_nm:.6f}", f"{cy_nm:.6f}"]
-                 for frame_id, frame_name, nm_per_px, cx_nm, cy_nm in self.centroid_records]
+                [[int(instance_id), frame_id, frame_name, f"{nm_per_px:.6f}", f"{cx_nm:.6f}", f"{cy_nm:.6f}"]
+                 for instance_id, (frame_id, frame_name, nm_per_px, cx_nm, cy_nm) in zip(export_ids, self.centroid_records)]
             )
 
         # Diameter and Height
         path4 = os.path.join(self.output_root, f"{self.gas_category}_diameter_height_vs_frame.csv")
         with open(path4, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
-            writer.writerow(["frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm", "diameter_nm", "height_nm"])
-            for row in self.diameter_height_records:
+            writer.writerow(["instance_id", "frame_id", "frame_name", "nm_per_pixel", "cx_nm", "cy_nm", "diameter_nm", "height_nm"])
+            for instance_id, row in zip(export_ids, self.diameter_height_records):
                 # row structure: [frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, min_x, min_y, max_x, max_y]
                 # we only export the first 7 fields here
-                writer.writerow([row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}", f"{row[4]:.6f}", f"{row[5]:.6f}", f"{row[6]:.6f}"])
+                writer.writerow([int(instance_id), row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}", f"{row[4]:.6f}", f"{row[5]:.6f}", f"{row[6]:.6f}"])
 
         print("Export finished:")
         print(f" - {path1}")
@@ -1832,19 +1878,19 @@ class GasTracker:
 # ======================
 if __name__ == "__main__":
     tracker = GasTracker(
-        json_dir="./data/defect_label",
-        image_path="./data/color_mask1121/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
+        json_dir="./data/20260508-mark",
+        image_path="./data/20260508-mark-color/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
         scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
+        #output_root="./result/0510",
         scale_value_nm=20.0,
         strict_scale_match=False,
-        gas_category="nanodroplet",
-
+        gas_category="gas",
         pin_category="pin"
     )
     tracker.process_all_frames()
     tracker.export_results()
     # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanodroplet",label_ids=True) 
+    tracker.annotate_images(output_dir="annotated_gas",label_ids=True) 
     tracker.plot_evolution(step=20)
     tracker.plot_centroid_trajectories(max_dist=50)
     tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
