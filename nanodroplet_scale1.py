@@ -1908,18 +1908,18 @@ class GasTracker:
 if __name__ == "__main__":
     tracker = GasTracker(
         json_dir="./data/20260508-mark",
-        image_path="./data/20260508-color/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
+        image_path="./data/20260508-mark-color/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
         scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
         #output_root="./result/0510",
         scale_value_nm=20.0,
         strict_scale_match=False,
-        gas_category="nanocluster",
+        gas_category="gas",
         pin_category="pin"
     )
     tracker.process_all_frames()
     tracker.export_results()
     # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanocluster",label_ids=True) 
+    tracker.annotate_images(output_dir="annotated_gas",label_ids=True) 
     tracker.plot_evolution(step=20)
     tracker.plot_centroid_trajectories(max_dist=50)
     tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
