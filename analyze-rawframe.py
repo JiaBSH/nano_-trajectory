@@ -14,7 +14,7 @@ class GasTracker:
     def __init__(
         self,
         json_dir,
-        image_path,
+        image_path=None,
         scale_csv=None,
         scale_value_nm=20.0,
         strict_scale_match=False,
@@ -23,7 +23,7 @@ class GasTracker:
     ):
         self.json_dir = json_dir
         self.image_path = image_path
-        self.image_dir = os.path.dirname(image_path)
+        self.image_dir = os.path.dirname(image_path) if image_path else None
         self.scale_csv = scale_csv
         self.scale_value_nm = float(scale_value_nm)
         self.strict_scale_match = bool(strict_scale_match)
@@ -42,6 +42,8 @@ class GasTracker:
         self.fallback_nm_per_px = None
         self.max_nm_per_px = None
         self.min_nm_per_px = None
+        self._warned_no_scale_csv = False
+        self._warned_missing_scale_match = False
         if self.scale_csv is not None:
             self.scale_map = self._load_nm_per_px_map(self.scale_csv, default_scale_value_nm=self.scale_value_nm)
             if len(self.scale_map) > 0:
@@ -63,9 +65,11 @@ class GasTracker:
         self.ref_pin_centroid = None
         self.last_shift = np.zeros(2)
 
-        # 画图准备
-        img = Image.open(image_path)
-        self.W, self.H = img.size
+        # 画图准备（image_path 可选；未设置时跳过依赖底图尺寸的绘图）
+        self.W, self.H = None, None
+        if self.image_path:
+            img = Image.open(self.image_path)
+            self.W, self.H = img.size
 
         # Make sure Chinese text can render on Windows (avoid "□□□" tofu boxes)
         self._configure_matplotlib_fonts()
@@ -93,6 +97,15 @@ class GasTracker:
         except Exception:
             # best-effort: still set a reasonable default list
             plt.rcParams["font.sans-serif"] = preferred
+
+        # Global plotting font sizes: keep all generated chart text consistently larger.
+        plt.rcParams["font.size"] = 17
+        plt.rcParams["axes.titlesize"] = 20
+        plt.rcParams["axes.labelsize"] = 17
+        plt.rcParams["xtick.labelsize"] = 15
+        plt.rcParams["ytick.labelsize"] = 15
+        plt.rcParams["legend.fontsize"] = 14
+        plt.rcParams["figure.titlesize"] = 20
 
         plt.rcParams["axes.unicode_minus"] = False
 
@@ -164,17 +177,35 @@ class GasTracker:
 
     def _nm_per_px_for_frame(self, frame_name):
         if self.scale_csv is None:
-            raise ValueError(
-                "scale_csv is required to output real units. "
-                "Provide the scalebar CSV (columns: image,pixel_length)."
-            )
+            # No scale CSV: keep pipeline running in pixel-space (1 px = 1 pseudo-nm unit).
+            if not self._warned_no_scale_csv:
+                print(
+                    "[warn] scale_csv is not set. Continue with fallback nm_per_px=1.0 "
+                    "(numerical values are pixel-scale, not real nm)."
+                )
+                self._warned_no_scale_csv = True
+            return 1.0
         v = self.scale_map.get(frame_name)
         if v is not None:
             return float(v)
         if self.strict_scale_match:
             raise KeyError(f"No scale entry for frame '{frame_name}' in {self.scale_csv}")
-        # user requested: if no matching scale for this frame, skip it
-        return None
+        # Non-strict mode: do not skip frame; use dataset-level fallback if available.
+        if self.fallback_nm_per_px is not None:
+            if not self._warned_missing_scale_match:
+                print(
+                    "[warn] Some frames have no matching scale in CSV. "
+                    f"Using fallback median nm_per_px={self.fallback_nm_per_px:.6f}."
+                )
+                self._warned_missing_scale_match = True
+            return float(self.fallback_nm_per_px)
+        if not self._warned_missing_scale_match:
+            print(
+                "[warn] No matching scale and no fallback available. "
+                "Use nm_per_px=1.0 (pixel-scale units)."
+            )
+            self._warned_missing_scale_match = True
+        return 1.0
 
     @staticmethod
     def _compute_droplet_dims_oriented(pts):
@@ -470,11 +501,23 @@ class GasTracker:
     # 工具函数
     # -----------------------------
     def _load_and_sort_jsons(self):
+        import re
+
         files = [
             f for f in os.listdir(self.json_dir)
             if f.endswith(".json")
         ]
-        files.sort(key=lambda x: int(x.split("_")[-1].split(".")[0]))
+
+        def _sort_key(name):
+            stem = Path(name).stem
+            m = re.search(r"(\d+)$", stem)
+            if m is not None:
+                # Keep original behavior for names ending with numeric frame id.
+                return (0, int(m.group(1)), stem.lower())
+            # Fallback: non-numeric names are sorted lexicographically after numeric ones.
+            return (1, 0, stem.lower())
+
+        files.sort(key=_sort_key)
         return files
 
     @staticmethod
@@ -722,12 +765,16 @@ class GasTracker:
                  
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
+
+        if not self.image_path or not self.image_dir:
+            print("[skip] annotate_images: image_path is not set.")
+            return
         
         print(f"Annotating images to {output_dir}...")
         
         try:
             # Try to start with a slightly larger font if possible
-            font = ImageFont.truetype("arial.ttf", 24)
+            font = ImageFont.truetype("arial.ttf", 38)
         except OSError:
             font = ImageFont.load_default()
 
@@ -886,7 +933,7 @@ class GasTracker:
         label_ids=False,
         id_mode="event",
         max_dist=50.0,
-        min_track_length=0,
+        min_track_length=3,
         use_display_id=True,
         mask_alpha=120,
     ):
@@ -919,10 +966,7 @@ class GasTracker:
 
         print(f"Annotating raw-frame images to {output_dir}...")
 
-        try:
-            font = ImageFont.truetype("arial.ttf", 24)
-        except OSError:
-            font = ImageFont.load_default()
+        # Font is initialised per-frame based on image size to avoid oversized labels.
 
         # Category-based fixed colour: nanocluster=red, nanodroplet=blue, gas=green, others=orange
         _CATEGORY_COLOR = {
@@ -937,6 +981,7 @@ class GasTracker:
         # ---- Build ID assignments (same logic as annotate_images) ----
         assigned_ids_by_frame = None
         display_id_of = None
+        allowed_instance_ids = None
         if bool(label_ids):
             if len(self.object_records) == 0:
                 print("[warn] label_ids=True but object_records is empty; run process_all_frames() first.")
@@ -962,6 +1007,7 @@ class GasTracker:
                 series_by_id_for_display = {
                     k: v for k, v in series_by_id.items() if len(v) >= int(min_track_length)
                 }
+                allowed_instance_ids = set(int(k) for k in series_by_id_for_display.keys())
                 if bool(use_display_id):
                     display_id_of = self._display_id_mapping(series_by_id_for_display)
                 else:
@@ -994,6 +1040,18 @@ class GasTracker:
                     # Convert to RGBA so we can composite a mask layer
                     bg = raw_im.convert("RGBA")
                     W, H = bg.size
+
+                    # Adaptive text size for different frame resolutions.
+                    # Example: 512px frame -> ~14px font; 1024px frame -> ~24px font.
+                    font_px = max(18, min(30, int(round(min(W, H) * 0.028))))
+                    try:
+                        font = ImageFont.truetype("arial.ttf", font_px)
+                    except OSError:
+                        font = ImageFont.load_default()
+                    id_offset_x = int(max(8, round(font_px * 0.8)))
+                    id_offset_y = int(max(8, round(font_px * 0.7)))
+                    centroid_r = int(max(3, round(font_px * 0.22)))
+                    stroke_w = int(max(1, round(font_px * 0.12)))
 
                     # Transparent overlay for filled masks
                     mask_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
@@ -1050,28 +1108,37 @@ class GasTracker:
                         if bool(label_ids) and ids_this_frame is not None and obj_idx < len(ids_this_frame):
                             try:
                                 instance_id = int(ids_this_frame[obj_idx])
+                                draw_id_label = True
+
+                                # Hide short-lived/noisy tracks to reduce excessive labels.
+                                if allowed_instance_ids is not None and instance_id not in allowed_instance_ids:
+                                    draw_id_label = False
+
                                 if display_id_of is not None:
                                     disp = int(display_id_of.get(instance_id, 0))
-                                    id_text = str(disp) if disp > 0 else str(instance_id)
+                                    if disp <= 0:
+                                        draw_id_label = False
+                                    id_text = str(disp) if disp > 0 else ""
                                 else:
                                     id_text = str(instance_id)
 
-                                cx_px = float(np.mean(pts_raw[:, 0]))
-                                cy_px = float(np.mean(pts_raw[:, 1]))
-                                r = 6
-                                draw.ellipse(
-                                    (cx_px - r, cy_px - r, cx_px + r, cy_px + r),
-                                    outline=_outline_rgb,
-                                    width=3,
-                                )
-                                draw.text(
-                                    (cx_px - 20, cy_px - 18),
-                                    id_text,
-                                    fill="orange",
-                                    font=font,
-                                    stroke_width=2,
-                                    stroke_fill="black",
-                                )
+                                if draw_id_label:
+                                    cx_px = float(np.mean(pts_raw[:, 0]))
+                                    cy_px = float(np.mean(pts_raw[:, 1]))
+                                    r = centroid_r
+                                    draw.ellipse(
+                                        (cx_px - r, cy_px - r, cx_px + r, cy_px + r),
+                                        outline=_outline_rgb,
+                                        width=2,
+                                    )
+                                    draw.text(
+                                        (cx_px - id_offset_x, cy_px - id_offset_y),
+                                        id_text,
+                                        fill="orange",
+                                        font=font,
+                                        stroke_width=stroke_w,
+                                        stroke_fill="black",
+                                    )
                             except Exception:
                                 pass
 
@@ -1165,10 +1232,7 @@ class GasTracker:
 
         print(f"Annotating all-categories raw-frame images to {output_dir}...")
 
-        try:
-            font = ImageFont.truetype("arial.ttf", 24)
-        except OSError:
-            font = ImageFont.load_default()
+        # Font is initialised per-frame based on image size to avoid oversized labels.
 
         _CATEGORY_COLOR = {
             "nanocluster": (220, 30, 30),
@@ -1256,6 +1320,16 @@ class GasTracker:
                     bg = raw_im.convert("RGBA")
                     W, H = bg.size
 
+                    font_px = max(18, min(32, int(round(min(W, H) * 0.029))))
+                    try:
+                        font = ImageFont.truetype("arial.ttf", font_px)
+                    except OSError:
+                        font = ImageFont.load_default()
+                    id_offset_x = int(max(8, round(font_px * 0.8)))
+                    id_offset_y = int(max(8, round(font_px * 0.7)))
+                    centroid_r = int(max(3, round(font_px * 0.22)))
+                    stroke_w = int(max(1, round(font_px * 0.12)))
+
                     mask_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
                     mask_draw = ImageDraw.Draw(mask_layer)
 
@@ -1309,7 +1383,7 @@ class GasTracker:
 
                         # Centroid dot
                         if bool(show_centroid):
-                            r = 5
+                            r = centroid_r
                             draw.ellipse((cx_px - r, cy_px - r, cx_px + r, cy_px + r),
                                          fill=rgb, outline="white", width=1)
 
@@ -1327,11 +1401,11 @@ class GasTracker:
                                     id_text = str(instance_id)
                                 try:
                                     draw.text(
-                                        (cx_px - 20, cy_px - 18),
+                                        (cx_px - id_offset_x, cy_px - id_offset_y),
                                         id_text,
                                         fill=rgb,
                                         font=font,
-                                        stroke_width=2,
+                                        stroke_width=stroke_w,
                                         stroke_fill="black",
                                     )
                                 except Exception:
@@ -1548,13 +1622,13 @@ class GasTracker:
         return {iid: idx + 1 for idx, iid in enumerate(ordered_ids)}
 
     def _build_event_id_series(self, detections_by_frame, max_dist=50.0, return_assignments=False):
-        """Assign globally-incrementing ids with merge/split relabeling.
+        """Assign globally-incrementing ids with continuity-first linking.
 
         Rules:
         - First frame detections get ids 1..N
-        - Merge (many prev -> one curr): curr gets a NEW id
-        - Split (one prev -> many curr): each child gets a NEW id
-        - 1-to-1 continuation keeps the same id
+        - Consecutive frames are linked by nearest-neighbor (one-to-one) within max_dist
+        - Matched detections keep previous ids, even if object counts change
+        - Unmatched current detections get NEW ids
 
                 detections_by_frame: dict[int, list[tuple[frame_name,nm_per_px,cx_nm,cy_nm,area_nm2]]]
                 returns:
@@ -1605,39 +1679,7 @@ class GasTracker:
                 prev_dets, prev_ids = curr_dets, []
                 continue
 
-            # If object count changes, treat as merge/split and relabel ALL current objects.
-            # This avoids false merge/split when objects are merely close.
-            if n_prev != n_curr:
-                new_ids = []
-                for j in range(n_curr):
-                    curr_ids[j] = int(next_id)
-                    new_ids.append(int(next_id))
-                    next_id += 1
-
-                if n_curr < n_prev:
-                    events.append(
-                        {
-                            "frame": frame,
-                            "type": "merge",
-                            "src_ids": [int(x) for x in prev_ids],
-                            "dst_ids": [int(x) for x in new_ids],
-                        }
-                    )
-                else:
-                    events.append(
-                        {
-                            "frame": frame,
-                            "type": "split",
-                            "src_ids": [int(x) for x in prev_ids],
-                            "dst_ids": [int(x) for x in new_ids],
-                        }
-                    )
-
-                assigned_ids_by_frame[frame] = curr_ids
-                prev_dets, prev_ids = curr_dets, curr_ids
-                continue
-
-            # n_prev == n_curr: do a one-to-one assignment by minimal distance.
+            # Do one-to-one assignment by minimal distance for all count combinations.
             prev_xy = np.array([[d[2], d[3]] for d in prev_dets], dtype=np.float64)
             curr_xy = np.array([[d[2], d[3]] for d in curr_dets], dtype=np.float64)
             dists = np.linalg.norm(prev_xy[:, None, :] - curr_xy[None, :, :], axis=2)
@@ -1822,7 +1864,7 @@ class GasTracker:
                     xy=(x0, y0),
                     xytext=(3, 3),
                     textcoords="offset points",
-                    fontsize=6,
+                    fontsize=12,
                     color=color,
                     bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
                 )
@@ -1854,7 +1896,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=8,
+                    fontsize=14,
                     ncol=ncol,
                 )
             elif n_items <= 60:
@@ -1871,7 +1913,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=7,
+                    fontsize=13,
                     ncol=ncol,
                     columnspacing=0.8,
                     handlelength=1.2,
@@ -1893,7 +1935,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=6,
+                    fontsize=12,
                     ncol=ncol,
                     columnspacing=0.8,
                     handlelength=1.2,
@@ -2049,7 +2091,7 @@ class GasTracker:
                     xy=(x0, y0),
                     xytext=(3, 3),
                     textcoords="offset points",
-                    fontsize=6,
+                    fontsize=12,
                     color=color,
                     bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
                 )
@@ -2073,7 +2115,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=8,
+                    fontsize=14,
                     ncol=1,
                 )
             elif n_items <= 60:
@@ -2089,7 +2131,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=7,
+                    fontsize=13,
                     ncol=2,
                     columnspacing=0.8,
                     handlelength=1.2,
@@ -2109,7 +2151,7 @@ class GasTracker:
                     framealpha=0.85,
                     facecolor="white",
                     edgecolor="gray",
-                    fontsize=6,
+                    fontsize=12,
                     ncol=ncol,
                     columnspacing=0.8,
                     handlelength=1.2,
@@ -2245,10 +2287,101 @@ class GasTracker:
             for fid, fname, da in delta_points:
                 writer.writerow([int(fid), str(fname), f"{float(da):.6f}"])
         print(f" - {out_csv}")
+
+    def plot_frame_instance_count_and_total_area(self, outname=None, out_csv=None):
+        """Plot per-frame instance count and total area as two separate figures.
+
+        Uses `self.area_records` where each row is one detected instance in a frame.
+        - instance_count(frame): number of instances in this frame
+        - total_area_nm2(frame): sum of all instance areas in this frame
+        """
+        if len(self.area_records) == 0:
+            print("No area records to plot frame totals.")
+            return
+
+        from collections import defaultdict
+
+        count_by_frame = defaultdict(int)
+        area_sum_by_frame = defaultdict(float)
+        name_by_frame = {}
+
+        for frame_id, frame_name, _nm_per_px, area_nm2 in self.area_records:
+            fid = int(frame_id)
+            count_by_frame[fid] += 1
+            area_sum_by_frame[fid] += float(area_nm2)
+            if fid not in name_by_frame:
+                name_by_frame[fid] = str(frame_name)
+
+        frame_ids = sorted(count_by_frame.keys())
+        if len(frame_ids) == 0:
+            print("No valid frame statistics to plot.")
+            return
+
+        if outname is None:
+            count_plot_path = os.path.join(self.output_root, f"{self.gas_category}_frame_instance_count.png")
+            area_plot_path = os.path.join(self.output_root, f"{self.gas_category}_frame_total_area.png")
+        else:
+            # If outname is provided, treat it as a shared prefix for two plot files.
+            if not os.path.isabs(outname):
+                outname = os.path.join(self.output_root, outname)
+            base, ext = os.path.splitext(outname)
+            if ext == "":
+                ext = ".png"
+            count_plot_path = f"{base}_instance_count{ext}"
+            area_plot_path = f"{base}_total_area{ext}"
+
+        if out_csv is None:
+            out_csv = os.path.join(self.output_root, f"{self.gas_category}_frame_count_area.csv")
+        elif not os.path.isabs(out_csv):
+            out_csv = os.path.join(self.output_root, out_csv)
+
+        frames = np.array(frame_ids, dtype=np.int32)
+        counts = np.array([count_by_frame[fid] for fid in frame_ids], dtype=np.int32)
+        areas = np.array([area_sum_by_frame[fid] for fid in frame_ids], dtype=np.float64)
+
+        # Plot 1: instance count only
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(frames, counts, color="#1f77b4", linewidth=1.8)
+        ax.set_xlabel("Frame id")
+        ax.set_ylabel("Instance count")
+        ax.grid(True, alpha=0.25)
+        ax.set_title(f"{self.gas_category}: per-frame instance count", loc="center")
+        plt.tight_layout()
+        plt.savefig(count_plot_path, dpi=300, bbox_inches="tight")
+        print(f"Saved frame instance-count plot: {count_plot_path}")
+        plt.close(fig)
+
+        # Plot 2: total area only
+        fig, ax = plt.subplots(figsize=(12, 5))
+        ax.plot(frames, areas, color="#d62728", linewidth=1.8)
+        ax.set_xlabel("Frame id")
+        ax.set_ylabel("Total area (nm^2)")
+        ax.grid(True, alpha=0.25)
+        ax.set_title(f"{self.gas_category}: per-frame total area", loc="center")
+        plt.tight_layout()
+        plt.savefig(area_plot_path, dpi=300, bbox_inches="tight")
+        print(f"Saved frame total-area plot: {area_plot_path}")
+        plt.close(fig)
+
+        with open(out_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_id", "frame_name", "instance_count", "total_area_nm2"])
+            for fid in frame_ids:
+                writer.writerow([
+                    int(fid),
+                    name_by_frame.get(int(fid), str(fid)),
+                    int(count_by_frame[fid]),
+                    f"{float(area_sum_by_frame[fid]):.6f}",
+                ])
+        print(f" - {out_csv}")
     # -----------------------------
     # 可视化（抽帧）
     # -----------------------------
     def plot_evolution(self, step=200):
+        if self.W is None or self.H is None:
+            print("[skip] plot_evolution: image_path is not set.")
+            return
+
         fig, ax = plt.subplots(figsize=(8, 8))
         scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
         ax.set_xlim(0, self.W * scale * 1.5)
@@ -2314,6 +2447,10 @@ class GasTracker:
         when their distance is <= max_dist. Save plot to PNG.
         NOTE: max_dist is in nm because centroids are stored in nm.
         """
+        if self.W is None or self.H is None:
+            print("[skip] plot_centroid_trajectories: image_path is not set.")
+            return
+
         if len(self.centroid_records) == 0:
             print("No centroid records to plot.")
             return
@@ -2415,35 +2552,36 @@ class GasTracker:
 # ======================
 if __name__ == "__main__":
     tracker = GasTracker(
-        json_dir="./data/20260508-mark",
-        image_path="./data/20260508-mark-color/11dd74426e8374ac110c4036c77c09ab_000000000003.png",
-        scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
+        json_dir=r"D:\code\nanojccode\data\TEM\zwl_42_label_512",
+        image_path=r"D:\code\nanojccode\data\TEM\zwl_42_label_512_voc\1 1 145kx 20251216_000000000000_SwinIR.png",
+        #scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
         #output_root="./result/0510",
         scale_value_nm=20.0,
         strict_scale_match=False,
-        gas_category="nanodroplet",
-        pin_category="pin"
+        gas_category="nanocluster",
+        #pin_category="pin"
     )
     tracker.process_all_frames()
     tracker.export_results()
     # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanodroplet", label_ids=True)
+    tracker.annotate_images(output_dir="annotated_nanocluster", label_ids=True)
     tracker.annotate_images_on_rawframe(
-        raw_frame_dir="./data/frame338",   # 原始帧图像所在目录
-        output_dir="annotated_nanodroplet_rawframe",
+        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
+        output_dir="annotated_nanocluster_rawframe",
         label_ids=True,
         mask_alpha=120,
     )
     tracker.annotate_allcategories_on_rawframe(
-        raw_frame_dir="./data/frame338",   # 原始帧图像所在目录
+        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
         output_dir="annotated_allcat_rawframe",
         mask_alpha=120,
         show_centroid=False,
         label_ids=False
     )
-    tracker.plot_evolution(step=20)
+    tracker.plot_evolution(step=2)
     tracker.plot_centroid_trajectories(max_dist=50)
     tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
+    tracker.plot_frame_instance_count_and_total_area()
     tracker.plot_area_delta_vs_frame(per_frame=True, reducer="sum")
     # 30 fps => 1/30 s per frame; speed unit: nm/s
     tracker.plot_velocity_trajectories(max_dist=50, min_track_length=0, frame_interval_s=1/30, bin_size_frames=1, debug_stats=True)
