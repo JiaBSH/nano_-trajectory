@@ -24,17 +24,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--frame-dir",
-        default="data/TEM/gas-liquid/gas-liquid-frame-crop",
+        default="data/TEM/gas-liquid/gas-liquid-frame-crop_x2",
         help="Source frame directory",
     )
     parser.add_argument(
         "--mark-dir",
-        default="data/TEM/gas-liquid/gas-liquid-mark-crop",
+        default="data/TEM/gas-liquid/gas-liquid-mark-crop_x2",
         help="Source mark directory",
     )
     parser.add_argument(
         "--split-root",
-        default="data/TEM/gas-liquid/gas-liquid-split-by-mark",
+        default="data/TEM/gas-liquid/gas-liquid-split-by-mark_x2",
         help="Output root directory containing group_* folders",
     )
     parser.add_argument(
@@ -66,11 +66,15 @@ def split_by_mark_intervals(
 ) -> int:
     frame_files = [p for p in frame_dir.iterdir() if p.is_file() and FRAME_PATTERN.match(p.name)]
     mark_files = [p for p in mark_dir.iterdir() if p.is_file() and MARK_PATTERN.match(p.name)]
+    isat_yaml = mark_dir / "isat.yaml"
 
     if not frame_files:
         raise SystemExit(f"No frame files found in: {frame_dir}")
     if not mark_files:
         raise SystemExit(f"No mark files found in: {mark_dir}")
+
+    if not isat_yaml.exists():
+        print(f"Warning: isat.yaml not found, skip yaml copy: {isat_yaml}")
 
     frame_map: dict[int, Path] = {}
     for f in frame_files:
@@ -125,6 +129,13 @@ def split_by_mark_intervals(
         else:
             frame_out.mkdir(parents=True, exist_ok=True)
             mark_out.mkdir(parents=True, exist_ok=True)
+
+        if isat_yaml.exists():
+            yaml_dst = mark_out / isat_yaml.name
+            if dry_run:
+                print(f"[DRY-RUN] copy yaml: {isat_yaml} -> {yaml_dst}")
+            else:
+                shutil.copy2(isat_yaml, yaml_dst)
 
         for idx in range(start_idx, end_idx + 1):
             if idx in frame_map:
