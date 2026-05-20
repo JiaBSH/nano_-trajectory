@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 from shutil import copy2
 
@@ -18,6 +19,20 @@ def write_json(path: Path, payload: dict) -> None:
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=4)
         handle.write("\n")
+
+
+def get_canvas_size_from_mark_dir(mark_dir: Path) -> tuple[int, int]:
+    json_files = sorted(mark_dir.glob("*.json"))
+    if not json_files:
+        raise FileNotFoundError(f"No JSON files found in: {mark_dir}")
+
+    payload = load_json(json_files[0])
+    info = payload.get("info", {})
+    width = int(info.get("width", 0))
+    height = int(info.get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid image size in: {json_files[0]}")
+    return width, height
 
 
 def collect_points_from_object(obj: dict) -> list[tuple[float, float]]:
@@ -174,6 +189,42 @@ def crop_isat_annotations(mark_dir: Path, output_dir: Path, crop_box: tuple[int,
     return count
 
 
+def save_crop_metadata(
+    meta_path: Path,
+    crop_box: tuple[int, int, int, int],
+    source_size: tuple[int, int],
+    margin: int,
+    frame_dir: Path,
+    mark_dir: Path,
+    output_frame_dir: Path,
+    output_mark_dir: Path,
+) -> None:
+    x1, y1, x2, y2 = crop_box
+    source_w, source_h = source_size
+    payload = {
+        "version": 1,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "crop_box": {"x1": x1, "y1": y1, "x2": x2, "y2": y2},
+        "crop_size": {"width": x2 - x1, "height": y2 - y1},
+        "source_size": {"width": source_w, "height": source_h},
+        "margin": int(margin),
+        # Coordinate transforms for projecting annotations between spaces.
+        "transform": {
+            "crop_to_source": {"x": "x + x1", "y": "y + y1"},
+            "source_to_crop": {"x": "x - x1", "y": "y - y1"},
+        },
+        "paths": {
+            "frame_dir": str(frame_dir),
+            "mark_dir": str(mark_dir),
+            "output_frame_dir": str(output_frame_dir),
+            "output_mark_dir": str(output_mark_dir),
+        },
+    }
+
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(meta_path, payload)
+
+
 def parse_args() -> argparse.Namespace:
     root = Path(__file__).resolve().parent
     default_frame_dir = root / "data" / "TEM" / "gas-liquid" / "gas-liquid-frame"
@@ -189,6 +240,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-frame-dir", type=Path, default=default_out_frame, help="Output cropped frame directory.")
     parser.add_argument("--output-mark-dir", type=Path, default=default_out_mark, help="Output cropped ISAT directory.")
     parser.add_argument("--margin", type=int, default=20, help="Extra margin in pixels around annotation union bbox.")
+    parser.add_argument(
+        "--crop-meta-path",
+        type=Path,
+        default=None,
+        help="Where to save crop parameters JSON (default: <output-mark-dir>/crop_params.json).",
+    )
     return parser.parse_args()
 
 
@@ -198,6 +255,9 @@ def main() -> None:
     mark_dir = args.mark_dir.resolve()
     output_frame_dir = args.output_frame_dir.resolve()
     output_mark_dir = args.output_mark_dir.resolve()
+    crop_meta_path = (
+        args.crop_meta_path.resolve() if args.crop_meta_path is not None else (output_mark_dir / "crop_params.json")
+    )
 
     if not frame_dir.is_dir():
         raise FileNotFoundError(f"Frame directory does not exist: {frame_dir}")
@@ -205,8 +265,19 @@ def main() -> None:
         raise FileNotFoundError(f"Mark directory does not exist: {mark_dir}")
 
     crop_box = compute_global_crop_box(mark_dir=mark_dir, margin=args.margin)
+    source_size = get_canvas_size_from_mark_dir(mark_dir)
     frame_count = crop_frames(frame_dir=frame_dir, output_dir=output_frame_dir, crop_box=crop_box)
     mark_count = crop_isat_annotations(mark_dir=mark_dir, output_dir=output_mark_dir, crop_box=crop_box)
+    save_crop_metadata(
+        meta_path=crop_meta_path,
+        crop_box=crop_box,
+        source_size=source_size,
+        margin=args.margin,
+        frame_dir=frame_dir,
+        mark_dir=mark_dir,
+        output_frame_dir=output_frame_dir,
+        output_mark_dir=output_mark_dir,
+    )
 
     x1, y1, x2, y2 = crop_box
     print(f"Crop box (x1, y1, x2, y2): ({x1}, {y1}, {x2}, {y2})")
@@ -215,6 +286,7 @@ def main() -> None:
     print(f"Cropped annotation JSON files: {mark_count}")
     print(f"Output frames: {output_frame_dir}")
     print(f"Output ISAT annotations: {output_mark_dir}")
+    print(f"Crop params JSON: {crop_meta_path}")
 
 
 if __name__ == "__main__":
