@@ -1,6 +1,7 @@
 import os
 import json
 import csv
+import time
 from pathlib import Path
 
 import numpy as np
@@ -11,31 +12,63 @@ from matplotlib import font_manager as fm
 
 
 class GasTracker:
+    IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
     def __init__(
         self,
         json_dir,
         image_path=None,
         scale_csv=None,
         scale_value_nm=20.0,
+        nm_per_px=None,
         strict_scale_match=False,
         gas_category="gas",
-        pin_category="pin"
+        pin_category="pin",
+        pin_reference_enabled=False,
+        skip_frames_without_pin=True,
+        max_particle_pin_distance_nm=None,
+        fastplot_enabled=True,
+        compute_diameter_height_enabled=True,
+        output_root=None
     ):
         self.json_dir = json_dir
-        self.image_path = image_path
-        self.image_dir = os.path.dirname(image_path) if image_path else None
+        self.image_path = os.fspath(image_path) if image_path else None
+        self.image_dir = None
         self.scale_csv = scale_csv
         self.scale_value_nm = float(scale_value_nm)
+        self.fixed_nm_per_px = float(nm_per_px) if nm_per_px is not None else None
         self.strict_scale_match = bool(strict_scale_match)
         self.gas_category = gas_category
         self.pin_category = pin_category
+        self.pin_reference_enabled = bool(pin_reference_enabled)
+        self.skip_frames_without_pin = bool(skip_frames_without_pin)
+        if max_particle_pin_distance_nm is None:
+            self.max_particle_pin_distance_nm = None
+        else:
+            self.max_particle_pin_distance_nm = float(max_particle_pin_distance_nm)
+            if self.max_particle_pin_distance_nm <= 0:
+                raise ValueError(
+                    f"max_particle_pin_distance_nm must be positive, got {self.max_particle_pin_distance_nm}"
+                )
+        self.fastplot_enabled = bool(fastplot_enabled)
+        self.compute_diameter_height_enabled = bool(compute_diameter_height_enabled)
+        self.pin_reference_records = []
+        self.filtered_far_particle_records = []
+        self.filtered_far_particle_count = 0
+        self.skipped_no_pin_frames = 0
+        self.processed_frame_count = 0
+        self._object_detections_by_frame_cache = None
+        self._event_id_series_cache = {}
         
-        # Create output root directory named as gas_category
-        self.output_root = self.gas_category
+        # Create output root directory.
+        if output_root is None:
+            output_root = f"{self.gas_category}_pin_relative" if self.pin_reference_enabled else self.gas_category
+        self.output_root = os.fspath(output_root)
         if not os.path.exists(self.output_root):
             os.makedirs(self.output_root)
 
         self.json_files = self._load_and_sort_jsons()
+        self.image_path, self.image_dir = self._resolve_image_input(self.image_path)
 
         # per-frame scale map: {frame_stem: nm_per_pixel}
         self.scale_map = {}
@@ -44,15 +77,28 @@ class GasTracker:
         self.min_nm_per_px = None
         self._warned_no_scale_csv = False
         self._warned_missing_scale_match = False
-        if self.scale_csv is not None:
-            self.scale_map = self._load_nm_per_px_map(self.scale_csv, default_scale_value_nm=self.scale_value_nm)
+        if self.fixed_nm_per_px is not None:
+            if self.fixed_nm_per_px <= 0:
+                raise ValueError(f"nm_per_px must be positive, got {self.fixed_nm_per_px}")
+            self.fallback_nm_per_px = self.fixed_nm_per_px
+            self.max_nm_per_px = self.fixed_nm_per_px
+            self.min_nm_per_px = self.fixed_nm_per_px
+        elif self.scale_csv is not None:
+            annotated_stems = {Path(name).stem for name in self.json_files}
+            self.scale_map = self._load_nm_per_px_map(
+                self.scale_csv,
+                default_scale_value_nm=self.scale_value_nm,
+                allowed_stems=annotated_stems,
+            )
             if len(self.scale_map) > 0:
                 vals = np.array(list(self.scale_map.values()), dtype=np.float64)
                 self.fallback_nm_per_px = float(np.median(vals))
                 self.max_nm_per_px = float(np.max(vals))
                 self.min_nm_per_px = float(np.min(vals))
             else:
-                raise ValueError(f"Scale CSV provided but no usable rows found: {self.scale_csv}")
+                raise ValueError(
+                    f"Scale CSV provided but no usable rows matched annotated JSON frames: {self.scale_csv}"
+                )
 
         # 数据容器（全部使用真实尺寸：nm / nm^2）
         self.area_records = []        # [frame_id, frame_name, nm_per_px, area_nm2]
@@ -68,8 +114,8 @@ class GasTracker:
         # 画图准备（image_path 可选；未设置时跳过依赖底图尺寸的绘图）
         self.W, self.H = None, None
         if self.image_path:
-            img = Image.open(self.image_path)
-            self.W, self.H = img.size
+            with Image.open(self.image_path) as img:
+                self.W, self.H = img.size
 
         # Make sure Chinese text can render on Windows (avoid "□□□" tofu boxes)
         self._configure_matplotlib_fonts()
@@ -109,6 +155,93 @@ class GasTracker:
 
         plt.rcParams["axes.unicode_minus"] = False
 
+    def _resolve_image_input(self, image_path):
+        """Accept either a single reference image or a directory of frame images."""
+        if not image_path:
+            return None, None
+
+        if os.path.isdir(image_path):
+            image_dir = image_path
+            ref_image = self._find_reference_image(image_dir)
+            if ref_image is None:
+                print(
+                    f"[warn] image_path points to a directory, but no image was found: {image_dir}. "
+                    "Plots will fall back to data bounds."
+                )
+            return ref_image, image_dir
+
+        return image_path, os.path.dirname(image_path)
+
+    def _find_reference_image(self, image_dir):
+        """Find the first image matching the sorted JSON frames, then fall back to any image."""
+        for json_name in self.json_files:
+            frame_name = Path(json_name).stem
+            for ext in self.IMAGE_EXTS:
+                candidate = os.path.join(image_dir, frame_name + ext)
+                if os.path.isfile(candidate):
+                    return candidate
+
+        try:
+            for name in sorted(os.listdir(image_dir)):
+                if Path(name).suffix.lower() in self.IMAGE_EXTS:
+                    candidate = os.path.join(image_dir, name)
+                    if os.path.isfile(candidate):
+                        return candidate
+        except OSError:
+            return None
+
+        return None
+
+    def _set_nm_axes(self, ax, point_arrays=None):
+        """Set plot axes from image size when available, otherwise from plotted nm data."""
+        scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
+        force_data_bounds = bool(getattr(self, "pin_reference_enabled", False))
+
+        if self.W is not None and self.H is not None and not force_data_bounds:
+            ax.set_xlim(0, self.W * scale * 1.5)
+            ax.set_ylim(self.H * scale, 0)
+        else:
+            arrays = []
+            for pts in point_arrays or []:
+                arr = np.asarray(pts, dtype=np.float64)
+                if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] < 2:
+                    continue
+                arr = arr[:, :2]
+                arr = arr[np.isfinite(arr).all(axis=1)]
+                if arr.shape[0] > 0:
+                    arrays.append(arr)
+
+            if not arrays:
+                return False
+
+            pts = np.vstack(arrays)
+            min_x, min_y = np.min(pts, axis=0)
+            max_x, max_y = np.max(pts, axis=0)
+            span = max(float(max_x - min_x), float(max_y - min_y))
+            pad = max(span * 0.05, 1.0)
+            ax.set_xlim(float(min_x - pad), float(max_x + pad))
+            ax.set_ylim(float(max_y + pad), float(min_y - pad))
+
+        if force_data_bounds:
+            ax.set_xlabel("x relative to pin centroid (nm)")
+            ax.set_ylabel("y relative to pin centroid (nm)")
+            ax.axhline(0.0, color="black", linewidth=0.8, alpha=0.25)
+            ax.axvline(0.0, color="black", linewidth=0.8, alpha=0.25)
+        else:
+            ax.set_xlabel("x (nm)")
+            ax.set_ylabel("y (nm)")
+        ax.set_aspect("equal", adjustable="box")
+        return True
+
+    @staticmethod
+    def _normalize_frame_step(frame_step):
+        if frame_step is None:
+            return 1
+        step = int(frame_step)
+        if step < 1:
+            raise ValueError("frame_step must be >= 1")
+        return step
+
     @staticmethod
     def _parse_scale_value_to_nm(scale_value, unit):
         if scale_value is None:
@@ -126,7 +259,7 @@ class GasTracker:
         return v
 
     @classmethod
-    def _load_nm_per_px_map(cls, csv_path, default_scale_value_nm=20.0):
+    def _load_nm_per_px_map(cls, csv_path, default_scale_value_nm=20.0, allowed_stems=None):
         """Load per-image nm/px from a scalebar CSV.
 
         Supports:
@@ -135,6 +268,7 @@ class GasTracker:
 
         Keying:
         - uses image basename stem, e.g. '..._000000000003'
+        - when allowed_stems is provided, rows for unannotated frames are ignored
         """
         csv_path = str(csv_path)
         if not os.path.exists(csv_path):
@@ -144,7 +278,8 @@ class GasTracker:
             )
 
         nm_per_px = {}
-        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+        allowed_stems = set(allowed_stems) if allowed_stems is not None else None
+        with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
             for row in reader:
                 img = (row.get("image") or row.get("img") or "").strip()
@@ -171,11 +306,15 @@ class GasTracker:
                     scale_nm = float(default_scale_value_nm)
 
                 stem = Path(img).stem
+                if allowed_stems is not None and stem not in allowed_stems:
+                    continue
                 nm_per_px[stem] = float(scale_nm) / float(pixel_length)
 
         return nm_per_px
 
     def _nm_per_px_for_frame(self, frame_name):
+        if self.fixed_nm_per_px is not None:
+            return float(self.fixed_nm_per_px)
         if self.scale_csv is None:
             # No scale CSV: keep pipeline running in pixel-space (1 px = 1 pseudo-nm unit).
             if not self._warned_no_scale_csv:
@@ -532,6 +671,30 @@ class GasTracker:
             np.dot(y, np.roll(x, -1))
         )
 
+    @staticmethod
+    def polygon_centroid(coords):
+        """Return the area centroid of a polygon and its absolute area."""
+        pts = np.asarray(coords, dtype=np.float64)
+        if pts.ndim != 2 or pts.shape[0] == 0 or pts.shape[1] < 2:
+            return None, 0.0
+
+        pts = pts[:, :2]
+        if pts.shape[0] < 3:
+            return pts.mean(axis=0), 0.0
+
+        x = pts[:, 0]
+        y = pts[:, 1]
+        x_next = np.roll(x, -1)
+        y_next = np.roll(y, -1)
+        cross = x * y_next - x_next * y
+        signed_area = 0.5 * np.sum(cross)
+        if abs(signed_area) < 1e-12:
+            return pts.mean(axis=0), 0.0
+
+        cx = np.sum((x + x_next) * cross) / (6.0 * signed_area)
+        cy = np.sum((y + y_next) * cross) / (6.0 * signed_area)
+        return np.array([cx, cy], dtype=np.float64), abs(float(signed_area))
+
     # -----------------------------
     # 主处理流程
     # -----------------------------
@@ -551,7 +714,26 @@ class GasTracker:
                 print(f"[skip] frame_id={frame_id} frame_name={frame_name}: no matching scale in CSV")
                 continue
 
-            shift = self._compute_pin_shift(data)
+            if self.pin_reference_enabled:
+                pin_centroid = self._compute_pin_centroid(data)
+                if pin_centroid is None:
+                    self.skipped_no_pin_frames += 1
+                    if self.skip_frames_without_pin:
+                        continue
+                    shift = self._compute_pin_shift(data)
+                else:
+                    shift = pin_centroid
+                    self.pin_reference_records.append([
+                        int(frame_id),
+                        frame_name,
+                        float(nm_per_px),
+                        float(pin_centroid[0]),
+                        float(pin_centroid[1]),
+                        float(pin_centroid[0]) * float(nm_per_px),
+                        float(pin_centroid[1]) * float(nm_per_px),
+                    ])
+            else:
+                shift = self._compute_pin_shift(data)
 
             self._process_gas_objects(
                 data,
@@ -560,19 +742,50 @@ class GasTracker:
                 nm_per_px,
                 shift
             )
+            self.processed_frame_count += 1
 
-    def _compute_pin_shift(self, data):
-        pin_pts = []
-        for obj in data.get("objects", []):
-            if obj.get("category") == self.pin_category:
-                pin_pts.append(
-                    np.array(obj["segmentation"], dtype=np.float32)
+        if self.pin_reference_enabled:
+            print(
+                f"[pin] processed {self.processed_frame_count} frames with pin reference; "
+                f"skipped {self.skipped_no_pin_frames} frames without pin."
+            )
+            if self.max_particle_pin_distance_nm is not None:
+                print(
+                    f"[pin] filtered {self.filtered_far_particle_count} {self.gas_category} objects farther than "
+                    f"{self.max_particle_pin_distance_nm:.6f} nm from pin centroid."
                 )
 
-        if len(pin_pts) > 0:
-            pin_pts = np.vstack(pin_pts)
-            pin_centroid = pin_pts.mean(axis=0)
+    def _compute_pin_centroid(self, data):
+        weighted_sum = np.zeros(2, dtype=np.float64)
+        total_area = 0.0
+        fallback_pts = []
+        for obj in data.get("objects", []):
+            if obj.get("category") == self.pin_category:
+                seg = obj.get("segmentation")
+                if seg is None:
+                    continue
+                pts = np.asarray(seg, dtype=np.float64)
+                if pts.ndim == 2 and pts.shape[0] > 0 and pts.shape[1] >= 2:
+                    centroid, area = self.polygon_centroid(pts[:, :2])
+                    if centroid is None:
+                        continue
+                    if area > 0:
+                        weighted_sum += centroid * area
+                        total_area += area
+                    else:
+                        fallback_pts.append(pts[:, :2])
 
+        if total_area > 0:
+            return weighted_sum / total_area
+
+        if len(fallback_pts) > 0:
+            return np.vstack(fallback_pts).mean(axis=0)
+
+        return None
+
+    def _compute_pin_shift(self, data):
+        pin_centroid = self._compute_pin_centroid(data)
+        if pin_centroid is not None:
             if self.ref_pin_centroid is None:
                 self.ref_pin_centroid = pin_centroid.copy()
 
@@ -597,49 +810,60 @@ class GasTracker:
             # ---- 面积 ----
             area_px2 = self.polygon_area(pts)
             area_nm2 = float(area_px2) * float(nm_per_px) * float(nm_per_px)
-            self.area_records.append([frame_id, frame_name, float(nm_per_px), area_nm2])
 
             # ---- 质心 ----
-            centroid = pts.mean(axis=0)
+            centroid, _centroid_area = self.polygon_centroid(pts)
+            if centroid is None:
+                centroid = pts.mean(axis=0)
             cx_px, cy_px = float(centroid[0]), float(centroid[1])
             cx_nm, cy_nm = cx_px * float(nm_per_px), cy_px * float(nm_per_px)
+            max_pin_dist = self.max_particle_pin_distance_nm
+            if self.pin_reference_enabled and max_pin_dist is not None:
+                dist_nm = float(np.hypot(cx_nm, cy_nm))
+                if dist_nm > float(max_pin_dist):
+                    self.filtered_far_particle_count += 1
+                    self.filtered_far_particle_records.append([
+                        int(frame_id),
+                        frame_name,
+                        float(nm_per_px),
+                        cx_nm,
+                        cy_nm,
+                        dist_nm,
+                        float(max_pin_dist),
+                        area_nm2,
+                    ])
+                    continue
+
+            self.area_records.append([frame_id, frame_name, float(nm_per_px), area_nm2])
             self.centroid_records.append([frame_id, frame_name, float(nm_per_px), cx_nm, cy_nm])
 
-            # ---- Diameter and Height (Rotating Calipers / Minimum Area Rectangle) ----
-            # The droplet is a semi-circle projected essentially as a "D" shape.
-            # The "bottom" is the flat side of the D. 
-            # We need to find the orientation of this flat side to measure Diameter (length of flat side)
-            # and Height (max perpendicular distance from flat side).
-            
-            # Use Rotating Calipers via Minimum Area Rectangle to find the major axes.
-            # For a semi-circle, the Minimum Area Rectangle usually aligns such that one side is the diameter.
-            
-            from scipy.spatial import ConvexHull
-            
-
-
-            try:
-                # Use the new robust method
-                if len(pts) >= 3:
-                     # Use the new robust method
-                    d_px, h_px, box_info = self._compute_droplet_dims_oriented(pts)
-                    d_nm = d_px * nm_per_px
-                    h_nm = h_px * nm_per_px
-                    
-                    self.diameter_height_records.append([
-                        frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, box_info
-                    ])
-                else:
-                    self.diameter_height_records.append([frame_id, frame_name, nm_per_px, cx_nm, cy_nm, 0, 0, {}])
-            except Exception as e:
-                # Fallback to AABB
-                print(f"Error in oriented calc: {e}, using AABB")
-                min_x, min_y = pts.min(axis=0)
-                max_x, max_y = pts.max(axis=0)
-                d_nm = (max_x - min_x) * nm_per_px
-                h_nm = (max_y - min_y) * nm_per_px
-                # Dummy values for the rest
-                self.diameter_height_records.append([frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, {}])
+            if not self.compute_diameter_height_enabled:
+                self.diameter_height_records.append([frame_id, frame_name, nm_per_px, cx_nm, cy_nm, 0, 0, {}])
+            else:
+                # ---- Diameter and Height (Rotating Calipers / Minimum Area Rectangle) ----
+                # The droplet is a semi-circle projected essentially as a "D" shape.
+                # The "bottom" is the flat side of the D. 
+                # We need to find the orientation of this flat side to measure Diameter (length of flat side)
+                # and Height (max perpendicular distance from flat side).
+                try:
+                    if len(pts) >= 3:
+                        d_px, h_px, box_info = self._compute_droplet_dims_oriented(pts)
+                        d_nm = d_px * nm_per_px
+                        h_nm = h_px * nm_per_px
+                        
+                        self.diameter_height_records.append([
+                            frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, box_info
+                        ])
+                    else:
+                        self.diameter_height_records.append([frame_id, frame_name, nm_per_px, cx_nm, cy_nm, 0, 0, {}])
+                except Exception as e:
+                    # Fallback to AABB
+                    print(f"Error in oriented calc: {e}, using AABB")
+                    min_x, min_y = pts.min(axis=0)
+                    max_x, max_y = pts.max(axis=0)
+                    d_nm = (max_x - min_x) * nm_per_px
+                    h_nm = (max_y - min_y) * nm_per_px
+                    self.diameter_height_records.append([frame_id, frame_name, nm_per_px, cx_nm, cy_nm, d_nm, h_nm, {}])
 
             # ---- 每个目标的聚合记录（用于追踪面积曲线）----
             self.object_records.append([frame_id, frame_name, float(nm_per_px), cx_nm, cy_nm, area_nm2])
@@ -655,10 +879,9 @@ class GasTracker:
     # -----------------------------
     # 数据导出
     # -----------------------------
-    def _build_export_instance_ids(self, max_dist=50.0, id_mode="event", use_display_id=True):
-        """Build per-record droplet ids aligned with object_records order."""
-        if len(self.object_records) == 0:
-            return []
+    def _object_detections_by_frame(self):
+        if self._object_detections_by_frame_cache is not None:
+            return self._object_detections_by_frame_cache
 
         from collections import defaultdict
 
@@ -666,14 +889,32 @@ class GasTracker:
         for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
             by_frame[int(frame_id)].append((frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2)))
 
+        self._object_detections_by_frame_cache = by_frame
+        return by_frame
+
+    def _event_id_series_for_object_records(self, max_dist=50.0):
+        key = (len(self.object_records), float(max_dist))
+        cached = self._event_id_series_cache.get(key)
+        if cached is not None:
+            return cached
+
+        result = self._build_event_id_series_with_assignments(
+            self._object_detections_by_frame(),
+            max_dist=max_dist,
+        )
+        self._event_id_series_cache[key] = result
+        return result
+
+    def _build_export_instance_ids(self, max_dist=50.0, id_mode="event", use_display_id=True):
+        """Build per-record droplet ids aligned with object_records order."""
+        if len(self.object_records) == 0:
+            return []
+
         mode = str(id_mode).strip().lower()
         if mode != "event":
             raise NotImplementedError("export_results currently supports id_mode='event' only")
 
-        series_by_id, assigned_ids_by_frame, _events = self._build_event_id_series_with_assignments(
-            by_frame,
-            max_dist=max_dist,
-        )
+        series_by_id, assigned_ids_by_frame, _events = self._event_id_series_for_object_records(max_dist=max_dist)
 
         if bool(use_display_id):
             display_id_of = self._display_id_mapping(series_by_id)
@@ -739,11 +980,69 @@ class GasTracker:
                 # we only export the first 7 fields here
                 writer.writerow([int(instance_id), row[0], row[1], f"{row[2]:.6f}", f"{row[3]:.6f}", f"{row[4]:.6f}", f"{row[5]:.6f}", f"{row[6]:.6f}"])
 
+        path5 = None
+        if self.pin_reference_enabled:
+            path5 = os.path.join(self.output_root, f"{self.gas_category}_pin_reference_centroids.csv")
+            with open(path5, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "frame_id",
+                    "frame_name",
+                    "nm_per_pixel",
+                    "pin_cx_px",
+                    "pin_cy_px",
+                    "pin_cx_nm",
+                    "pin_cy_nm",
+                ])
+                for row in self.pin_reference_records:
+                    frame_id, frame_name, nm_per_px, pin_cx_px, pin_cy_px, pin_cx_nm, pin_cy_nm = row
+                    writer.writerow([
+                        int(frame_id),
+                        frame_name,
+                        f"{float(nm_per_px):.6f}",
+                        f"{float(pin_cx_px):.6f}",
+                        f"{float(pin_cy_px):.6f}",
+                        f"{float(pin_cx_nm):.6f}",
+                        f"{float(pin_cy_nm):.6f}",
+                    ])
+
+        path6 = None
+        if self.pin_reference_enabled and self.max_particle_pin_distance_nm is not None:
+            path6 = os.path.join(self.output_root, f"{self.gas_category}_filtered_far_from_pin.csv")
+            with open(path6, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "frame_id",
+                    "frame_name",
+                    "nm_per_pixel",
+                    "cx_nm",
+                    "cy_nm",
+                    "distance_to_pin_nm",
+                    "threshold_nm",
+                    "area_nm2",
+                ])
+                for row in self.filtered_far_particle_records:
+                    frame_id, frame_name, nm_per_px, cx_nm, cy_nm, dist_nm, threshold_nm, area_nm2 = row
+                    writer.writerow([
+                        int(frame_id),
+                        frame_name,
+                        f"{float(nm_per_px):.6f}",
+                        f"{float(cx_nm):.6f}",
+                        f"{float(cy_nm):.6f}",
+                        f"{float(dist_nm):.6f}",
+                        f"{float(threshold_nm):.6f}",
+                        f"{float(area_nm2):.6f}",
+                    ])
+
         print("Export finished:")
         print(f" - {path1}")
         print(f" - {path2}")
         print(f" - {path3}")
         print(f" - {path4}")
+        if path5 is not None:
+            print(f" - {path5}")
+        if path6 is not None:
+            print(f" - {path6}")
 
     def annotate_images(
         self,
@@ -936,6 +1235,7 @@ class GasTracker:
         min_track_length=3,
         use_display_id=True,
         mask_alpha=120,
+        frame_step=1,
     ):
         """Generate annotated images using the original raw frames as background.
 
@@ -955,7 +1255,10 @@ class GasTracker:
                               receive a display ID label.
             use_display_id: Remap internal IDs to compact 1-based display IDs.
             mask_alpha: Alpha value (0-255) for filled mask overlays.
+            frame_step: Save one annotated image every N frames. Use 1 for all frames.
         """
+        frame_step = self._normalize_frame_step(frame_step)
+
         if output_dir is None:
             output_dir = os.path.join(self.output_root, "annotated_rawframe")
         elif not os.path.isabs(output_dir):
@@ -964,7 +1267,7 @@ class GasTracker:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        print(f"Annotating raw-frame images to {output_dir}...")
+        print(f"Annotating raw-frame images to {output_dir} (frame_step={frame_step})...")
 
         # Font is initialised per-frame based on image size to avoid oversized labels.
 
@@ -1021,8 +1324,12 @@ class GasTracker:
 
         # ---- Per-frame annotation ----
         possible_exts = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+        saved_count = 0
 
         for frame_id, json_name in enumerate(self.json_files):
+            if int(frame_id) % frame_step != 0:
+                continue
+
             frame_name = Path(json_name).stem
 
             # Locate raw frame image
@@ -1183,11 +1490,12 @@ class GasTracker:
 
                     out_path = os.path.join(output_dir, frame_name + ".png")
                     img_out.save(out_path)
+                    saved_count += 1
 
             except Exception as e:
                 print(f"Error annotating raw frame {frame_name}: {e}")
 
-        print(f"Raw-frame annotation complete: {output_dir}")
+        print(f"Raw-frame annotation complete: {output_dir} ({saved_count} images saved)")
 
     def annotate_allcategories_on_rawframe(
         self,
@@ -1198,6 +1506,7 @@ class GasTracker:
         label_ids=True,
         max_dist=50.0,
         use_display_id=True,
+        frame_step=1,
     ):
         """Generate annotated images using the original raw frames as background,
         drawing masks and outlines for ALL annotation categories in each JSON.
@@ -1221,7 +1530,10 @@ class GasTracker:
             label_ids: Whether to draw instance ID labels.
             max_dist: Maximum centroid linking distance (nm) for ID tracking.
             use_display_id: Remap internal IDs to compact 1-based display IDs.
+            frame_step: Save one annotated image every N frames. Use 1 for all frames.
         """
+        frame_step = self._normalize_frame_step(frame_step)
+
         if output_dir is None:
             output_dir = os.path.join(self.output_root, "annotated_allcat_rawframe")
         elif not os.path.isabs(output_dir):
@@ -1230,7 +1542,7 @@ class GasTracker:
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
 
-        print(f"Annotating all-categories raw-frame images to {output_dir}...")
+        print(f"Annotating all-categories raw-frame images to {output_dir} (frame_step={frame_step})...")
 
         # Font is initialised per-frame based on image size to avoid oversized labels.
 
@@ -1302,8 +1614,12 @@ class GasTracker:
 
         # ---- Per-frame annotation ----
         possible_exts = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
+        saved_count = 0
 
         for frame_id, json_name in enumerate(self.json_files):
+            if int(frame_id) % frame_step != 0:
+                continue
+
             frame_name = Path(json_name).stem
 
             raw_img_path = None
@@ -1455,11 +1771,12 @@ class GasTracker:
 
                     out_path = os.path.join(output_dir, frame_name + ".png")
                     img_out.save(out_path)
+                    saved_count += 1
 
             except Exception as e:
                 print(f"Error annotating all-categories raw frame {frame_name}: {e}")
 
-        print(f"All-categories raw-frame annotation complete: {output_dir}")
+        print(f"All-categories raw-frame annotation complete: {output_dir} ({saved_count} images saved)")
 
     def export_tracked_area_results(self, tracks, out_csv=None):
         """Export tracked area series.
@@ -1621,6 +1938,29 @@ class GasTracker:
         ordered_ids = sorted(first_frame_by_id.keys(), key=lambda i: (first_frame_by_id[i], i))
         return {iid: idx + 1 for idx, iid in enumerate(ordered_ids)}
 
+    @staticmethod
+    def _select_plot_instance_ids(series_by_id, max_plot_tracks=None):
+        """Return track ids to draw, preferring longer tracks when the plot is crowded."""
+        ids = [int(k) for k, pts in series_by_id.items() if len(pts) > 0]
+        total = len(ids)
+        if max_plot_tracks is None or int(max_plot_tracks) <= 0 or total <= int(max_plot_tracks):
+            return sorted(ids), total
+
+        def sort_key(iid):
+            pts = series_by_id.get(iid) or []
+            first_frame = min((int(p[0]) for p in pts), default=10**12)
+            return (-len(pts), first_frame, int(iid))
+
+        selected = sorted(ids, key=sort_key)[:int(max_plot_tracks)]
+        return selected, total
+
+    @staticmethod
+    def _positive_plot_limit(value):
+        if value is None:
+            return None
+        value = int(value)
+        return value if value > 0 else None
+
     def _build_event_id_series(self, detections_by_frame, max_dist=50.0, return_assignments=False):
         """Assign globally-incrementing ids with continuity-first linking.
 
@@ -1769,7 +2109,17 @@ class GasTracker:
 
         return tracks
 
-    def plot_area_trajectories(self, max_dist=50.0, min_track_length=1, outname=None, id_mode="event", debug_stats=False):
+    def plot_area_trajectories(
+        self,
+        max_dist=50.0,
+        min_track_length=1,
+        outname=None,
+        id_mode="event",
+        debug_stats=False,
+        max_plot_tracks=500,
+        max_legend_items=60,
+        annotate_ids_max=80,
+    ):
         """Plot each droplet's area-vs-frame curve in one figure.
 
         Tracks are built by greedy centroid linking.
@@ -1779,11 +2129,7 @@ class GasTracker:
             print("No object records to plot area trajectories.")
             return
 
-        from collections import defaultdict
-
-        by_frame = defaultdict(list)
-        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
-            by_frame[int(frame_id)].append((frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2)))
+        by_frame = self._object_detections_by_frame()
 
         if bool(debug_stats):
             n_frames = len(by_frame)
@@ -1802,7 +2148,10 @@ class GasTracker:
                 print(f"[debug] {self.gas_category} area: greedy tracks after length filter={len(tracks)}")
             series_by_id = {int(track_id): [(p[0], p[1], p[2], p[3], p[4], p[5]) for p in t["points"]] for track_id, t in enumerate(tracks)}
         else:
-            series_by_id, _events = self._build_event_id_series(by_frame, max_dist=max_dist)
+            if by_frame is self._object_detections_by_frame():
+                series_by_id, _assigned_ids_by_frame, _events = self._event_id_series_for_object_records(max_dist=max_dist)
+            else:
+                series_by_id, _events = self._build_event_id_series(by_frame, max_dist=max_dist)
             if bool(debug_stats):
                 print(f"[debug] {self.gas_category} area: event ids before length filter={len(series_by_id)}")
             series_by_id = {k: v for k, v in series_by_id.items() if len(v) >= int(min_track_length)}
@@ -1824,12 +2173,28 @@ class GasTracker:
         # color cycle (good for dozens of tracks; for hundreds, they'll repeat)
         cmap = plt.cm.tab20
 
+        fastplot_enabled = bool(getattr(self, "fastplot_enabled", True))
+        plot_max_tracks = self._positive_plot_limit(max_plot_tracks) if fastplot_enabled else None
+        legend_max_items = self._positive_plot_limit(max_legend_items) if fastplot_enabled else None
+        annotate_max = self._positive_plot_limit(annotate_ids_max) if fastplot_enabled else None
+
         display_id_of = self._display_id_mapping(series_by_id)
-        instance_ids = sorted(series_by_id.keys())
+        instance_ids, total_instance_ids = self._select_plot_instance_ids(
+            series_by_id,
+            max_plot_tracks=plot_max_tracks,
+        )
+        if total_instance_ids > len(instance_ids):
+            print(
+                f"[warn] {self.gas_category} area plot has {total_instance_ids} tracks; "
+                f"drawing the longest {len(instance_ids)} tracks only. Full series is still exported."
+            )
 
         if bool(debug_stats):
             max_disp = max(display_id_of.values()) if len(display_id_of) > 0 else 0
-            print(f"[debug] {self.gas_category} area: plotted_ids={len(instance_ids)}, display_id_max={max_disp}")
+            print(
+                f"[debug] {self.gas_category} area: plotted_ids={len(instance_ids)}, "
+                f"total_ids={total_instance_ids}, display_id_max={max_disp}"
+            )
 
         line_handles = []
         line_labels = []
@@ -1855,21 +2220,21 @@ class GasTracker:
             line_id_label = str(int(disp_id) if disp_id > 0 else int(instance_id))
             line_labels.append(line_id_label)
 
-            # Mark ID at the start of each curve
-            try:
-                x0 = float(frames[0])
-                y0 = float(areas[0])
-                ax.annotate(
-                    line_id_label,
-                    xy=(x0, y0),
-                    xytext=(3, 3),
-                    textcoords="offset points",
-                    fontsize=12,
-                    color=color,
-                    bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
-                )
-            except Exception:
-                pass
+            if annotate_max is None or len(instance_ids) <= int(annotate_max):
+                try:
+                    x0 = float(frames[0])
+                    y0 = float(areas[0])
+                    ax.annotate(
+                        line_id_label,
+                        xy=(x0, y0),
+                        xytext=(3, 3),
+                        textcoords="offset points",
+                        fontsize=12,
+                        color=color,
+                        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
+                    )
+                except Exception:
+                    pass
 
         if bool(debug_stats):
             if len(skipped_empty) > 0:
@@ -1880,10 +2245,12 @@ class GasTracker:
         leg = None
         if len(line_handles) > 0:
             n_items = len(line_handles)
-
-            # Prefer right-side legend for moderate counts; switch to multi-column / bottom for very long legends.
-            if n_items <= 20:
-                ncol = 1
+            if legend_max_items is not None and n_items > int(legend_max_items):
+                print(
+                    f"[warn] Skip area legend: {n_items} plotted tracks exceed "
+                    f"max_legend_items={int(legend_max_items)}."
+                )
+            elif n_items <= 20:
                 fig.set_size_inches(12, 6, forward=True)
                 fig.subplots_adjust(right=0.80)
                 leg = ax.legend(
@@ -1897,10 +2264,9 @@ class GasTracker:
                     facecolor="white",
                     edgecolor="gray",
                     fontsize=14,
-                    ncol=ncol,
+                    ncol=1,
                 )
             elif n_items <= 60:
-                ncol = 2
                 fig.set_size_inches(14, 6, forward=True)
                 fig.subplots_adjust(right=0.78)
                 leg = ax.legend(
@@ -1914,13 +2280,11 @@ class GasTracker:
                     facecolor="white",
                     edgecolor="gray",
                     fontsize=13,
-                    ncol=ncol,
+                    ncol=2,
                     columnspacing=0.8,
                     handlelength=1.2,
                 )
             else:
-                # Too many: put legend below with more columns to avoid clipping.
-                # Aim for <= ~12 rows in legend.
                 rows_target = 12
                 ncol = int(np.ceil(float(n_items) / float(rows_target)))
                 ncol = max(4, min(10, ncol))
@@ -1942,11 +2306,12 @@ class GasTracker:
                 )
 
         ax.set_title(
-            f"{self.gas_category}: area vs frame (per droplet track) | tracks={len(instance_ids)}",
+            f"{self.gas_category}: area vs frame | plotted={len(instance_ids)} of {total_instance_ids} tracks",
             loc="center",
         )
         plt.tight_layout()
         plt.savefig(outname, dpi=300, bbox_inches="tight", bbox_extra_artists=((leg,) if leg is not None else None))
+        plt.close(fig)
         print(f"Saved area trajectories plot: {outname}")
 
         # also export tracked series for downstream analysis
@@ -1964,6 +2329,9 @@ class GasTracker:
         frame_interval_s=1.0,
         bin_size_frames=10,
         debug_stats=False,
+        max_plot_tracks=500,
+        max_legend_items=60,
+        annotate_ids_max=80,
     ):
         """Plot each individual's speed-vs-frame curve.
 
@@ -1974,11 +2342,7 @@ class GasTracker:
             print("No object records to plot velocity trajectories.")
             return
 
-        from collections import defaultdict
-
-        by_frame = defaultdict(list)
-        for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in self.object_records:
-            by_frame[int(frame_id)].append((frame_name, float(nm_per_px), float(cx_nm), float(cy_nm), float(area_nm2)))
+        by_frame = self._object_detections_by_frame()
 
         if bool(debug_stats):
             n_frames = len(by_frame)
@@ -2001,7 +2365,10 @@ class GasTracker:
                 for track_id, t in enumerate(tracks)
             }
         else:
-            series_by_id, _events = self._build_event_id_series(by_frame, max_dist=max_dist)
+            if by_frame is self._object_detections_by_frame():
+                series_by_id, _assigned_ids_by_frame, _events = self._event_id_series_for_object_records(max_dist=max_dist)
+            else:
+                series_by_id, _events = self._build_event_id_series(by_frame, max_dist=max_dist)
             if bool(debug_stats):
                 print(f"[debug] {self.gas_category} speed: event ids before length filter={len(series_by_id)}")
             series_by_id = {k: v for k, v in series_by_id.items() if len(v) >= int(min_track_length)}
@@ -2059,8 +2426,21 @@ class GasTracker:
         ax.grid(True, alpha=0.25)
 
         cmap = plt.cm.tab20
+        fastplot_enabled = bool(getattr(self, "fastplot_enabled", True))
+        plot_max_tracks = self._positive_plot_limit(max_plot_tracks) if fastplot_enabled else None
+        legend_max_items = self._positive_plot_limit(max_legend_items) if fastplot_enabled else None
+        annotate_max = self._positive_plot_limit(annotate_ids_max) if fastplot_enabled else None
+
         display_id_of = self._display_id_mapping(binned_speed_by_id)
-        instance_ids = sorted(binned_speed_by_id.keys())
+        instance_ids, total_instance_ids = self._select_plot_instance_ids(
+            binned_speed_by_id,
+            max_plot_tracks=plot_max_tracks,
+        )
+        if total_instance_ids > len(instance_ids):
+            print(
+                f"[warn] {self.gas_category} speed plot has {total_instance_ids} tracks; "
+                f"drawing the longest {len(instance_ids)} tracks only. Full series is still exported."
+            )
 
         line_handles = []
         line_labels = []
@@ -2082,27 +2462,32 @@ class GasTracker:
             line_id_label = str(int(disp_id) if disp_id > 0 else int(instance_id))
             line_labels.append(line_id_label)
 
-            # Mark ID at the start of each curve
-            try:
-                x0 = float(frames[0])
-                y0 = float(speeds[0])
-                ax.annotate(
-                    line_id_label,
-                    xy=(x0, y0),
-                    xytext=(3, 3),
-                    textcoords="offset points",
-                    fontsize=12,
-                    color=color,
-                    bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
-                )
-            except Exception:
-                pass
+            if annotate_max is None or len(instance_ids) <= int(annotate_max):
+                try:
+                    x0 = float(frames[0])
+                    y0 = float(speeds[0])
+                    ax.annotate(
+                        line_id_label,
+                        xy=(x0, y0),
+                        xytext=(3, 3),
+                        textcoords="offset points",
+                        fontsize=12,
+                        color=color,
+                        bbox={"boxstyle": "round,pad=0.2", "facecolor": "white", "edgecolor": "none", "alpha": 0.65},
+                    )
+                except Exception:
+                    pass
 
         # legend layout (same idea as area plot)
         leg = None
         if len(line_handles) > 0:
             n_items = len(line_handles)
-            if n_items <= 20:
+            if legend_max_items is not None and n_items > int(legend_max_items):
+                print(
+                    f"[warn] Skip speed legend: {n_items} plotted tracks exceed "
+                    f"max_legend_items={int(legend_max_items)}."
+                )
+            elif n_items <= 20:
                 fig.set_size_inches(12, 6, forward=True)
                 fig.subplots_adjust(right=0.80)
                 leg = ax.legend(
@@ -2158,11 +2543,18 @@ class GasTracker:
                 )
 
         if b == 1:
-            ax.set_title(f"{self.gas_category}: velocity vs frame (per track) | tracks={len(instance_ids)}", loc="center")
+            ax.set_title(
+                f"{self.gas_category}: velocity vs frame | plotted={len(instance_ids)} of {total_instance_ids} tracks",
+                loc="center",
+            )
         else:
-            ax.set_title(f"{self.gas_category}: mean velocity per {b} frames | tracks={len(instance_ids)}", loc="center")
+            ax.set_title(
+                f"{self.gas_category}: mean velocity per {b} frames | plotted={len(instance_ids)} of {total_instance_ids} tracks",
+                loc="center",
+            )
         plt.tight_layout()
         plt.savefig(outname, dpi=300, bbox_inches="tight", bbox_extra_artists=((leg,) if leg is not None else None))
+        plt.close(fig)
         print(f"Saved velocity trajectories plot: {outname}")
 
         # export for downstream analysis
@@ -2378,17 +2770,8 @@ class GasTracker:
     # 可视化（抽帧）
     # -----------------------------
     def plot_evolution(self, step=200):
-        if self.W is None or self.H is None:
-            print("[skip] plot_evolution: image_path is not set.")
-            return
-
         fig, ax = plt.subplots(figsize=(8, 8))
-        scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
-        ax.set_xlim(0, self.W * scale * 1.5)
-        ax.set_ylim(self.H * scale, 0)
-        ax.set_xlabel("x (nm)")
-        ax.set_ylabel("y (nm)")
-        ax.set_aspect("equal", adjustable="box")
+        point_arrays = []
 
         cmap = plt.cm.plasma
         norm = Normalize(vmin=0, vmax=len(self.json_files) - 1)
@@ -2409,6 +2792,7 @@ class GasTracker:
 
             pts = np.array(pts)
             pts = np.vstack([pts, pts[0]])
+            point_arrays.append(pts)
 
             ax.plot(
                 pts[:, 0],
@@ -2417,6 +2801,11 @@ class GasTracker:
                 linewidth=1.5,
                 alpha=0.85
             )
+
+        if not self._set_nm_axes(ax, point_arrays):
+            plt.close(fig)
+            print("No contour records to plot.")
+            return
 
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
@@ -2439,20 +2828,72 @@ class GasTracker:
         ax.add_patch(rect)
         outname = os.path.join(self.output_root, f"{self.gas_category}_evolution.png")
         plt.savefig(outname, dpi=300, bbox_inches="tight")
+        plt.close(fig)
         print(f"Saved evolution plot: {outname}")
 
-    def plot_centroid_trajectories(self, max_dist=50.0):
+    def plot_centroid_trajectories(self, max_dist=50.0, max_fastplot_points=100000):
         """
         Build simple greedy tracks by linking centroids in consecutive frames
         when their distance is <= max_dist. Save plot to PNG.
         NOTE: max_dist is in nm because centroids are stored in nm.
         """
-        if self.W is None or self.H is None:
-            print("[skip] plot_centroid_trajectories: image_path is not set.")
-            return
-
         if len(self.centroid_records) == 0:
             print("No centroid records to plot.")
+            return
+
+        fastplot_enabled = bool(getattr(self, "fastplot_enabled", True))
+        if fastplot_enabled:
+            rows = self.centroid_records
+            total_points = len(rows)
+            if total_points == 0:
+                print("No centroid records to plot.")
+                return
+
+            max_points = int(max_fastplot_points) if max_fastplot_points is not None else 0
+            if max_points > 0 and total_points > max_points:
+                stride = int(np.ceil(float(total_points) / float(max_points)))
+                rows = rows[::stride]
+                print(
+                    f"[warn] {self.gas_category} centroid plot has {total_points} points; "
+                    f"drawing every {stride}th point ({len(rows)} points)."
+                )
+
+            frames = np.array([int(r[0]) for r in rows], dtype=np.int32)
+            xs = np.array([float(r[3]) for r in rows], dtype=np.float64)
+            ys = np.array([float(r[4]) for r in rows], dtype=np.float64)
+            pts_for_axes = np.column_stack([xs, ys])
+
+            fig, ax = plt.subplots(figsize=(8, 8))
+            cmap = plt.cm.plasma
+            norm = Normalize(vmin=0, vmax=max(len(self.json_files) - 1, 1))
+            ax.scatter(xs, ys, c=frames, cmap=cmap, norm=norm, s=1, linewidths=0, alpha=0.9)
+
+            if not self._set_nm_axes(ax, [pts_for_axes]):
+                plt.close(fig)
+                print("No centroid records to plot.")
+                return
+
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+            sm.set_array([])
+            from mpl_toolkits.axes_grid1 import make_axes_locatable
+            divider = make_axes_locatable(ax)
+            cax = divider.append_axes("right", size="3%", pad=0.10)
+            cbar = fig.colorbar(sm, cax=cax)
+            cbar.set_label("Frame id")
+
+            ax.set_title(
+                f"{self.gas_category} centroid positions (fastplot, time-colored) | points={len(rows)}",
+                loc="center",
+            )
+            plt.tight_layout()
+            outname = os.path.join(self.output_root, f"{self.gas_category}_centroid_trajectories.png")
+            from matplotlib.patches import Rectangle
+            rect = Rectangle((0, 0), 1, 1, transform=ax.transAxes,
+                             fill=False, edgecolor="black", linewidth=3, zorder=10, clip_on=False)
+            ax.add_patch(rect)
+            plt.savefig(outname, dpi=300, bbox_inches="tight")
+            plt.close(fig)
+            print(f"Saved centroid trajectories plot: {outname}")
             return
 
         from collections import defaultdict
@@ -2496,12 +2937,7 @@ class GasTracker:
 
         # plotting
         fig, ax = plt.subplots(figsize=(8, 8))
-        scale = float(self.max_nm_per_px) if self.max_nm_per_px is not None else 1.0
-        ax.set_xlim(0, self.W * scale * 1.5)
-        ax.set_ylim(self.H * scale, 0)
-        ax.set_xlabel("x (nm)")
-        ax.set_ylabel("y (nm)")
-        ax.set_aspect("equal", adjustable="box")
+        point_arrays = []
 
         # color by frame (time axis) — use same colormap/norm as evolution
         cmap = plt.cm.plasma
@@ -2513,6 +2949,7 @@ class GasTracker:
             pts = np.array([[p[2], p[3]] for p in t['points']])
             if pts.shape[0] == 0:
                 continue
+            point_arrays.append(pts)
 
             # draw colored segments between consecutive points according to the earlier frame
             for i in range(len(pts) - 1):
@@ -2521,6 +2958,11 @@ class GasTracker:
 
             # scatter points colored by their frame
             sc = ax.scatter(pts[:, 0], pts[:, 1], c=frames, cmap=cmap, norm=norm, s=1)
+
+        if not self._set_nm_axes(ax, point_arrays):
+            plt.close(fig)
+            print("No centroid records to plot.")
+            return
 
         # add colorbar (time axis)
         sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
@@ -2544,6 +2986,7 @@ class GasTracker:
                  linewidth=border_width, zorder=10, clip_on=False)
         ax.add_patch(rect)
         plt.savefig(outname, dpi=300, bbox_inches="tight")
+        plt.close(fig)
         print(f"Saved centroid trajectories plot: {outname}")
 
 
@@ -2551,37 +2994,132 @@ class GasTracker:
 # 主程序入口
 # ======================
 if __name__ == "__main__":
+    # Pin reference: True => analyze only frames with pin and use each pin centroid as origin.
+    pin_reference_enabled = True
+    skip_frames_without_pin = True
+    max_particle_pin_distance_nm = 150
+
+    # Fast plot: True => limit crowded trajectory plots; False => draw all tracks with full legends/labels.
+    fastplot_enabled = True
+    plot_max_tracks = 500 if fastplot_enabled else 0
+    plot_max_legend_items = 60 if fastplot_enabled else 0
+    plot_annotate_ids_max = 80 if fastplot_enabled else 0
+    compute_diameter_height_enabled = False
+    save_raw_frame_annotations = False
+    save_allcategory_raw_frame_annotations = False
+    save_evolution_plot = True
+    save_centroid_trajectory_plot = True
+    save_area_trajectory_plot = True
+    save_frame_count_area_plots = True
+    save_area_delta_plot = True
+    save_velocity_trajectory_plot = True
+
+    gas_category = "gas"
+    output_root = f"{gas_category}_pin_relative" if pin_reference_enabled else gas_category
+    raw_frame_dir = r"D:\code\zwl_NANO\data\20260519 1 0 29000x-气泡颗粒成核生长_frames_png"
+    visualize_raw_frames = save_raw_frame_annotations or save_allcategory_raw_frame_annotations
+    # Raw-frame annotation stride: 1 = every frame; 1000 = every 1000th frame.
+    visualization_frame_step = 1000 if fastplot_enabled else 1
+    print(
+        f"[mode] fastplot_enabled={fastplot_enabled}, "
+        f"visualization_frame_step={visualization_frame_step}, "
+        f"plot_max_tracks={plot_max_tracks}, "
+        f"plot_max_legend_items={plot_max_legend_items}, "
+        f"plot_annotate_ids_max={plot_annotate_ids_max}, "
+        f"max_particle_pin_distance_nm={max_particle_pin_distance_nm}, "
+        f"compute_diameter_height_enabled={compute_diameter_height_enabled}, "
+        f"save_raw_frame_annotations={save_raw_frame_annotations}, "
+        f"save_allcategory_raw_frame_annotations={save_allcategory_raw_frame_annotations}"
+    )
+    print(
+        f"[plots] evolution={save_evolution_plot}, centroid={save_centroid_trajectory_plot}, "
+        f"area={save_area_trajectory_plot}, frame_count_area={save_frame_count_area_plots}, "
+        f"area_delta={save_area_delta_plot}, velocity={save_velocity_trajectory_plot}"
+    )
+
+    def timed_step(label, func):
+        t0 = time.perf_counter()
+        print(f"[time] start {label}")
+        result = func()
+        dt = time.perf_counter() - t0
+        print(f"[time] done  {label}: {dt:.2f}s")
+        return result
+
     tracker = GasTracker(
-        json_dir=r"D:\code\nanojccode\data\TEM\zwl_42_label_512",
-        image_path=r"D:\code\nanojccode\data\TEM\zwl_42_label_512_voc\1 1 145kx 20251216_000000000000_SwinIR.png",
-        #scale_csv=r"D:\code\nanojccode\data\nanoframes\scalebar_mauel.csv",
+        json_dir=r"D:\code\zwl_NANO\data\predictions_isat_merged_forward_names",
+        scale_csv=r"D:\code\zwl_NANO\data\scalebar_for_analyze_rawframe_dynamic_20nm_50nm_filled_forward_names.csv",
         #output_root="./result/0510",
-        scale_value_nm=20.0,
-        strict_scale_match=False,
-        gas_category="nanocluster",
-        #pin_category="pin"
+        strict_scale_match=True,
+        gas_category=gas_category,
+        pin_category="pin",
+        pin_reference_enabled=pin_reference_enabled,
+        skip_frames_without_pin=skip_frames_without_pin,
+        max_particle_pin_distance_nm=max_particle_pin_distance_nm,
+        fastplot_enabled=fastplot_enabled,
+        compute_diameter_height_enabled=compute_diameter_height_enabled,
+        output_root=output_root,
     )
-    tracker.process_all_frames()
-    tracker.export_results()
-    # Output dir logic now inside class if passed None, or relative to output_root if passed string
-    tracker.annotate_images(output_dir="annotated_nanocluster", label_ids=True)
-    tracker.annotate_images_on_rawframe(
-        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
-        output_dir="annotated_nanocluster_rawframe",
-        label_ids=True,
-        mask_alpha=120,
-    )
-    tracker.annotate_allcategories_on_rawframe(
-        raw_frame_dir="D:\\code\\nanojccode\\data\\TEM\\swinir_real_sr_x2_resize512",   # 原始帧图像所在目录
-        output_dir="annotated_allcat_rawframe",
-        mask_alpha=120,
-        show_centroid=False,
-        label_ids=False
-    )
-    tracker.plot_evolution(step=2)
-    tracker.plot_centroid_trajectories(max_dist=50)
-    tracker.plot_area_trajectories(max_dist=50, min_track_length=0, debug_stats=True)
-    tracker.plot_frame_instance_count_and_total_area()
-    tracker.plot_area_delta_vs_frame(per_frame=True, reducer="sum")
+    timed_step("process_all_frames", tracker.process_all_frames)
+    timed_step("export_results", tracker.export_results)
+
+    if save_raw_frame_annotations:
+        timed_step(
+            "annotate_images_on_rawframe",
+            lambda: tracker.annotate_images_on_rawframe(
+                raw_frame_dir=raw_frame_dir,
+                output_dir=f"annotated_{gas_category}_rawframe",
+                label_ids=True,
+                mask_alpha=120,
+                frame_step=visualization_frame_step,
+            ),
+        )
+    if save_allcategory_raw_frame_annotations:
+        timed_step(
+            "annotate_allcategories_on_rawframe",
+            lambda: tracker.annotate_allcategories_on_rawframe(
+                raw_frame_dir=raw_frame_dir,
+                output_dir="annotated_allcat_rawframe",
+                mask_alpha=120,
+                show_centroid=False,
+                label_ids=False,
+                frame_step=visualization_frame_step,
+            ),
+        )
+    if not visualize_raw_frames:
+        print("[skip] Raw-frame visualization disabled.")
+
+    if save_evolution_plot:
+        timed_step("plot_evolution", lambda: tracker.plot_evolution(step=2))
+    if save_centroid_trajectory_plot:
+        timed_step("plot_centroid_trajectories", lambda: tracker.plot_centroid_trajectories(max_dist=20))
+    if save_area_trajectory_plot:
+        timed_step(
+            "plot_area_trajectories",
+            lambda: tracker.plot_area_trajectories(
+                max_dist=20,
+                min_track_length=0,
+                debug_stats=True,
+                max_plot_tracks=plot_max_tracks,
+                max_legend_items=plot_max_legend_items,
+                annotate_ids_max=plot_annotate_ids_max,
+            ),
+        )
+    if save_frame_count_area_plots:
+        timed_step("plot_frame_instance_count_and_total_area", tracker.plot_frame_instance_count_and_total_area)
+    if save_area_delta_plot:
+        timed_step("plot_area_delta_vs_frame", lambda: tracker.plot_area_delta_vs_frame(per_frame=True, reducer="sum"))
     # 30 fps => 1/30 s per frame; speed unit: nm/s
-    tracker.plot_velocity_trajectories(max_dist=50, min_track_length=0, frame_interval_s=1/30, bin_size_frames=1, debug_stats=True)
+    if save_velocity_trajectory_plot:
+        timed_step(
+            "plot_velocity_trajectories",
+            lambda: tracker.plot_velocity_trajectories(
+                max_dist=20,
+                min_track_length=0,
+                frame_interval_s=1/30,
+                bin_size_frames=1,
+                debug_stats=True,
+                max_plot_tracks=plot_max_tracks,
+                max_legend_items=plot_max_legend_items,
+                annotate_ids_max=plot_annotate_ids_max,
+            ),
+        )
