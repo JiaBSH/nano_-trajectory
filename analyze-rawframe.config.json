@@ -1,0 +1,57 @@
+{
+  "config_version": 2,
+  "input": {
+    "json_dir": "data/wzq/20260508-mark",
+    "scale_csv": "data/wzq/frame338/scale_bar_detection/scale_bar_detections.csv",
+    "image_path": null,
+    "raw_frame_dir": "data/wzq/frame338",
+    "scale_value_nm": 20.0,
+    "nm_per_px": null,
+    "strict_scale_match": true
+  },
+  "analysis": {
+    "target_category": "nanodroplet",
+    "pin_category": "pin",
+    "pin_reference_enabled": true,
+    "skip_frames_without_pin": true,
+    "max_particle_pin_distance_nm": 150.0,
+    "fastplot_enabled": true,
+    "compute_diameter_height_enabled": false
+  },
+  "output": {
+    "root": null,
+    "export_csv_results": true,
+    "export_max_dist_nm": 50.0,
+    "export_use_display_id": true
+  },
+  "annotations": {
+    "save_target_raw_frames": false,
+    "save_all_category_raw_frames":true,
+    "frame_step": 10,
+    "mask_alpha": 120,
+    "target_output_dir": null,
+    "all_category_output_dir": "annotated_allcat_rawframe",
+    "target_label_ids": true,
+    "all_category_label_ids": false,
+    "all_category_show_centroid": false
+  },
+  "plots": {
+    "save_evolution": true,
+    "save_centroid_trajectories": true,
+    "save_area_trajectories": true,
+    "save_frame_count_area": true,
+    "save_area_delta": true,
+    "save_velocity_trajectories": true,
+    "max_dist_nm": 20.0,
+    "min_track_length": 0,
+    "max_tracks": 500,
+    "max_legend_items": 60,
+    "annotate_ids_max": 80,
+    "debug_stats": true,
+    "evolution_step": 2,
+    "area_delta_per_frame": true,
+    "area_delta_reducer": "sum",
+    "frame_interval_s": 0.03333333333333333,
+    "velocity_bin_size_frames": 5
+  }
+}
