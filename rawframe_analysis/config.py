@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import tempfile
 from copy import deepcopy
@@ -31,11 +32,14 @@ class InputConfig:
 class AnalysisConfig:
     target_category: str = "gas"
     pin_category: str = "pin"
+    particle_category: str = "nanocluster"
+    droplet_category: str = "nanodroplet"
     pin_reference_enabled: bool = False
     skip_frames_without_pin: bool = True
     max_particle_pin_distance_nm: float | None = None
     fastplot_enabled: bool = True
     compute_diameter_height_enabled: bool = False
+    compute_boundary_distances_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,10 +54,12 @@ class OutputConfig:
 class AnnotationConfig:
     save_target_raw_frames: bool = False
     save_all_category_raw_frames: bool = False
+    save_boundary_pair_id_raw_frames: bool = False
     frame_step: int = 1
     mask_alpha: int = 120
     target_output_dir: str | None = None
     all_category_output_dir: str = "annotated_allcat_rawframe"
+    boundary_pair_output_dir: str = "annotated_boundary_pair_ids_rawframe"
     target_label_ids: bool = True
     all_category_label_ids: bool = False
     all_category_show_centroid: bool = False
@@ -67,7 +73,8 @@ class PlotConfig:
     save_frame_count_area: bool = True
     save_area_delta: bool = True
     save_velocity_trajectories: bool = True
-    max_dist_nm: float = 20.0
+    save_boundary_distance_plots: bool = False
+    max_dist_nm: float = 50.0
     min_track_length: int = 0
     max_tracks: int = 500
     max_legend_items: int = 60
@@ -322,21 +329,25 @@ class RawFrameConfig:
             )
         _require_bool("input.strict_scale_match", self.input.strict_scale_match)
 
-        if (
-            not isinstance(self.analysis.target_category, str)
-            or not self.analysis.target_category.strip()
+        for name in (
+            "target_category",
+            "pin_category",
+            "particle_category",
+            "droplet_category",
         ):
-            raise ConfigError("'analysis.target_category' must be a non-empty string")
-        if (
-            not isinstance(self.analysis.pin_category, str)
-            or not self.analysis.pin_category.strip()
-        ):
-            raise ConfigError("'analysis.pin_category' must be a non-empty string")
+            value = getattr(self.analysis, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"'analysis.{name}' must be a non-empty string")
+        if self.analysis.particle_category == self.analysis.droplet_category:
+            raise ConfigError(
+                "'analysis.particle_category' and 'analysis.droplet_category' must be different"
+            )
         for name in (
             "pin_reference_enabled",
             "skip_frames_without_pin",
             "fastplot_enabled",
             "compute_diameter_height_enabled",
+            "compute_boundary_distances_enabled",
         ):
             _require_bool(f"analysis.{name}", getattr(self.analysis, name))
         if self.analysis.max_particle_pin_distance_nm is not None:
@@ -358,7 +369,11 @@ class RawFrameConfig:
             strictly_positive=True,
         )
 
-        for name in ("save_target_raw_frames", "save_all_category_raw_frames"):
+        for name in (
+            "save_target_raw_frames",
+            "save_all_category_raw_frames",
+            "save_boundary_pair_id_raw_frames",
+        ):
             _require_bool(f"annotations.{name}", getattr(self.annotations, name))
         _require_number(
             "annotations.frame_step", self.annotations.frame_step, minimum=1
@@ -381,12 +396,24 @@ class RawFrameConfig:
             "all_category_show_centroid",
         ):
             _require_bool(f"annotations.{name}", getattr(self.annotations, name))
-        for name in ("target_output_dir", "all_category_output_dir"):
+        for name in (
+            "target_output_dir",
+            "all_category_output_dir",
+            "boundary_pair_output_dir",
+        ):
             value = getattr(self.annotations, name)
             if value is not None and (not isinstance(value, str) or not value.strip()):
                 raise ConfigError(
                     f"'annotations.{name}' must be null or a non-empty string"
                 )
+        if (
+            self.annotations.save_boundary_pair_id_raw_frames
+            and not self.analysis.compute_boundary_distances_enabled
+        ):
+            raise ConfigError(
+                "'annotations.save_boundary_pair_id_raw_frames' requires "
+                "'analysis.compute_boundary_distances_enabled' to be true"
+            )
 
         for name in (
             "save_evolution",
@@ -395,13 +422,32 @@ class RawFrameConfig:
             "save_frame_count_area",
             "save_area_delta",
             "save_velocity_trajectories",
+            "save_boundary_distance_plots",
             "debug_stats",
             "area_delta_per_frame",
         ):
             _require_bool(f"plots.{name}", getattr(self.plots, name))
+        if (
+            self.plots.save_boundary_distance_plots
+            and not self.analysis.compute_boundary_distances_enabled
+        ):
+            raise ConfigError(
+                "'plots.save_boundary_distance_plots' requires "
+                "'analysis.compute_boundary_distances_enabled' to be true"
+            )
         _require_number(
             "plots.max_dist_nm", self.plots.max_dist_nm, strictly_positive=True
         )
+        if not math.isclose(
+            float(self.plots.max_dist_nm),
+            float(self.output.export_max_dist_nm),
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ConfigError(
+                "'plots.max_dist_nm' must equal 'output.export_max_dist_nm' so "
+                "object IDs stay consistent across CSV files, plots, and annotations"
+            )
         _require_number(
             "plots.frame_interval_s",
             self.plots.frame_interval_s,
@@ -442,6 +488,7 @@ class RawFrameConfig:
         annotations_enabled = (
             self.annotations.save_target_raw_frames
             or self.annotations.save_all_category_raw_frames
+            or self.annotations.save_boundary_pair_id_raw_frames
         )
         if annotations_enabled:
             if self.input.raw_frame_dir is None:

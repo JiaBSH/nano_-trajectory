@@ -44,6 +44,7 @@ class VelocityTrajectoryPlotMixin:
                 f"frame_interval_s={float(frame_interval_s)}, bin_size_frames={int(bin_size_frames)}"
             )
 
+        display_id_of = None
         if str(id_mode).lower() == "greedy":
             tracks = self._build_greedy_tracks(by_frame, max_dist=max_dist)
             if bool(debug_stats):
@@ -61,21 +62,25 @@ class VelocityTrajectoryPlotMixin:
                 ]
                 for track_id, t in enumerate(tracks)
             }
+            display_id_of = self._display_id_mapping(series_by_id)
         else:
             if by_frame is self._object_detections_by_frame():
-                series_by_id, _assigned_ids_by_frame, _events = (
+                full_series_by_id, _assigned_ids_by_frame, _events = (
                     self._event_id_series_for_object_records(max_dist=max_dist)
                 )
             else:
-                series_by_id, _events = self._build_event_id_series(
+                full_series_by_id, _events = self._build_event_id_series(
                     by_frame, max_dist=max_dist
                 )
+            display_id_of = self._display_id_mapping(full_series_by_id)
             if bool(debug_stats):
                 print(
-                    f"[debug] {self.target_category} speed: event ids before length filter={len(series_by_id)}"
+                    f"[debug] {self.target_category} speed: event ids before length filter={len(full_series_by_id)}"
                 )
             series_by_id = {
-                k: v for k, v in series_by_id.items() if len(v) >= int(min_track_length)
+                k: v
+                for k, v in full_series_by_id.items()
+                if len(v) >= int(min_track_length)
             }
             if bool(debug_stats):
                 print(
@@ -117,9 +122,9 @@ class VelocityTrajectoryPlotMixin:
         if bool(debug_stats):
             max_disp = 0
             if len(binned_speed_by_id) > 0:
-                display_id_of_dbg = self._display_id_mapping(binned_speed_by_id)
-                max_disp = (
-                    max(display_id_of_dbg.values()) if len(display_id_of_dbg) > 0 else 0
+                max_disp = max(
+                    int(display_id_of.get(int(instance_id), int(instance_id)))
+                    for instance_id in binned_speed_by_id
                 )
             print(
                 f"[debug] {self.target_category} speed: plotted_ids={len(binned_speed_by_id)}, display_id_max={max_disp}"
@@ -156,7 +161,6 @@ class VelocityTrajectoryPlotMixin:
             self._positive_plot_limit(annotate_ids_max) if fastplot_enabled else None
         )
 
-        display_id_of = self._display_id_mapping(binned_speed_by_id)
         instance_ids, total_instance_ids = self._select_plot_instance_ids(
             binned_speed_by_id,
             max_plot_tracks=plot_max_tracks,
@@ -184,7 +188,9 @@ class VelocityTrajectoryPlotMixin:
             color = cmap(int(disp_id) % 20)
             (line,) = ax.plot(frames, speeds, color=color, linewidth=1.2, alpha=0.85)
             line_handles.append(line)
-            line_id_label = str(int(disp_id) if disp_id > 0 else int(instance_id))
+            line_id_label = self._format_category_display_id(
+                int(disp_id) if disp_id > 0 else int(instance_id)
+            )
             line_labels.append(line_id_label)
 
             if annotate_max is None or len(instance_ids) <= int(annotate_max):
@@ -294,11 +300,14 @@ class VelocityTrajectoryPlotMixin:
 
         # export for downstream analysis
         if b == 1:
-            self.export_speed_series(speed_series_by_id)
+            self.export_speed_series(
+                speed_series_by_id, display_id_of=display_id_of
+            )
         else:
             self.export_speed_series(
                 binned_speed_by_id,
                 out_csv=f"{self.target_category}_instance_speed_mean_{b}frames.csv",
+                display_id_of=display_id_of,
             )
 
     def plot_speed_trajectories(self, *args, **kwargs):

@@ -39,6 +39,42 @@ Every successful run writes two copies of the fully resolved configuration:
 - `<output.root>/run_configs/run_config_YYYYMMDD_HHMMSS_ffffff.json` is the
   immutable configuration snapshot for that run.
 
+When `analysis.compute_boundary_distances_enabled` is `true`, the analysis also
+exports three per-frame distance tables. Distances are measured between closed
+segmentation boundaries in nm; touching, intersecting, and containment all
+produce a distance of zero:
+
+- `nanocluster_to_nanocluster_boundary_distances.csv`: every unique particle pair.
+- `nanocluster_to_nanodroplet_boundary_distances.csv`: every particle-droplet pair.
+- `nanocluster_nearest_boundary_distances.csv`: the nearest particle and nearest
+  droplet for each particle.
+
+The category names are configurable through `analysis.particle_category` and
+`analysis.droplet_category`; output filenames follow those values.
+
+Set `plots.save_boundary_distance_plots` to `true` to also generate:
+
+- `nanocluster_to_nanocluster_boundary_distance_vs_frame.png`
+- `nanocluster_to_nanodroplet_boundary_distance_vs_frame.png`
+
+Each plot uses frame id on the x-axis and boundary distance in nm on the y-axis.
+Particles and droplets are tracked independently between consecutive frames using
+the shared centroid-linking threshold in `output.export_max_dist_nm`. The same
+value must be used in `plots.max_dist_nm`, ensuring every stable ID is identical
+across CSV files, plots, and raw-frame annotations. Every stable pair ID gets
+its own distance curve, and missing frames break rather than interpolate the line.
+For a droplet target, `D1` is the same object as `instance_id=1` in the centroid,
+area, and speed CSV files; particle targets follow the equivalent `P1` rule.
+One-frame tracks have no computable speed and are omitted from the speed output,
+but the remaining IDs are never renumbered.
+
+When `annotations.save_boundary_pair_id_raw_frames` is `true`, a second raw-frame
+overlay set is written to `annotated_boundary_pair_ids_rawframe`. It preserves the
+normal all-category masks and outlines but labels particles as `P1`, `P2`, ... and
+droplets as `D1`, `D2`, ... so the objects correspond directly to the pair names
+in the distance-plot legend. The existing `annotated_allcat_rawframe` output is
+still generated independently and is unchanged.
+
 The code is separated by responsibility:
 
 - `rawframe_analysis/config.py`: typed configuration, validation, and snapshots.

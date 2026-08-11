@@ -57,8 +57,8 @@ def sync_pin_annotations(source_dir: Path, target_dir: Path) -> dict[str, int]:
 
 def parse_args() -> argparse.Namespace:
     root_dir = Path(__file__).resolve().parent
-    default_source = root_dir / "data" / "defect_label"
-    default_target = root_dir / "data" / "20260508-mark"
+    default_source = r'D:\code\nanojccode\data\zwl\zwl2\label'
+    default_target = r'd:\code\zwl_NANO\outputs\zwl2_stage_instance_nc_v7_imagenet_fp32_20260807\delivery\mask2former_v7\fullframe\mask2former_r50_zwl2_stage_instance_nc_v7_imagenet_fp32\predictions_isat'
 
     parser = argparse.ArgumentParser(
         description="Copy pin annotations from defect_label JSON files into matching 20260508-mark JSON files."

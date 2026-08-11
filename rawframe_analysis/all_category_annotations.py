@@ -13,6 +13,55 @@ from PIL import Image, ImageDraw, ImageFont
 class AllCategoryAnnotationMixin:
     """Provide rendering every segmentation category on original raw frames."""
 
+    def annotate_boundary_pair_ids_on_rawframe(
+        self,
+        raw_frame_dir,
+        output_dir=None,
+        mask_alpha=120,
+        show_centroid=False,
+        max_dist=50.0,
+        frame_step=1,
+    ):
+        """Render a separate all-category overlay labeled with plot pair IDs.
+
+        Particle labels use ``P1``, ``P2``, ... and droplet labels use ``D1``,
+        ``D2``, ... using exactly the same tracking assignments as the boundary
+        distance trajectory plots.
+        """
+        return self.annotate_allcategories_on_rawframe(
+            raw_frame_dir=raw_frame_dir,
+            output_dir=output_dir or "annotated_boundary_pair_ids_rawframe",
+            mask_alpha=mask_alpha,
+            show_centroid=show_centroid,
+            label_ids=True,
+            max_dist=max_dist,
+            use_display_id=True,
+            frame_step=frame_step,
+            boundary_pair_labels=True,
+        )
+
+    def _boundary_pair_annotation_ids(self, max_dist):
+        """Build plot-aligned P/D display IDs for raw-frame annotation."""
+        assignments = {}
+        prefixes = {}
+        for category, records, prefix in (
+            (
+                str(self.particle_category).strip().lower(),
+                self.boundary_particle_records,
+                "P",
+            ),
+            (
+                str(self.droplet_category).strip().lower(),
+                self.boundary_droplet_records,
+                "D",
+            ),
+        ):
+            assignments[category] = self._tracked_category_ids(
+                records, max_dist=float(max_dist), category=category
+            )
+            prefixes[category] = prefix
+        return assignments, prefixes
+
     def annotate_allcategories_on_rawframe(
         self,
         raw_frame_dir,
@@ -23,6 +72,7 @@ class AllCategoryAnnotationMixin:
         max_dist=50.0,
         use_display_id=True,
         frame_step=1,
+        boundary_pair_labels=False,
     ):
         """Generate annotated images using the original raw frames as background,
         drawing masks and outlines for ALL annotation categories in each JSON.
@@ -47,6 +97,9 @@ class AllCategoryAnnotationMixin:
             max_dist: Maximum centroid linking distance (nm) for ID tracking.
             use_display_id: Remap internal IDs to compact 1-based display IDs.
             frame_step: Save one annotated image every N frames. Use 1 for all frames.
+            boundary_pair_labels: Internal mode used by
+                annotate_boundary_pair_ids_on_rawframe to label only the
+                distance-plot categories with matching P/D IDs.
         """
         frame_step = self._normalize_frame_step(frame_step)
 
@@ -127,19 +180,26 @@ class AllCategoryAnnotationMixin:
         # Build per-category ID assignments
         cat_assigned_ids = {}  # cat -> {frame_id: [id, ...]}
         cat_display_id_of = {}  # cat -> {instance_id: display_id}
+        boundary_prefix_by_cat = {}
 
         if bool(label_ids):
-            for cat, det_by_frame in cat_dets.items():
-                series_by_id, assigned_ids, _events = (
-                    self._build_event_id_series_with_assignments(
-                        det_by_frame, max_dist=float(max_dist)
-                    )
+            if bool(boundary_pair_labels):
+                cat_assigned_ids, boundary_prefix_by_cat = (
+                    self._boundary_pair_annotation_ids(max_dist=max_dist)
                 )
-                cat_assigned_ids[cat] = assigned_ids
-                if bool(use_display_id):
-                    cat_display_id_of[cat] = self._display_id_mapping(series_by_id)
-                else:
-                    cat_display_id_of[cat] = None
+                cat_display_id_of = {cat: None for cat in cat_assigned_ids}
+            else:
+                for cat, det_by_frame in cat_dets.items():
+                    series_by_id, assigned_ids, _events = (
+                        self._build_event_id_series_with_assignments(
+                            det_by_frame, max_dist=float(max_dist)
+                        )
+                    )
+                    cat_assigned_ids[cat] = assigned_ids
+                    if bool(use_display_id):
+                        cat_display_id_of[cat] = self._display_id_mapping(series_by_id)
+                    else:
+                        cat_display_id_of[cat] = None
 
         # ---- Per-frame annotation ----
         possible_exts = [".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"]
@@ -256,9 +316,36 @@ class AllCategoryAnnotationMixin:
                                     )
                                 else:
                                     id_text = str(instance_id)
+                                prefix = boundary_prefix_by_cat.get(cat, "")
+                                if prefix:
+                                    id_text = f"{prefix}{id_text}"
                                 try:
+                                    text_position = (
+                                        cx_px - id_offset_x,
+                                        cy_px - id_offset_y,
+                                    )
+                                    if bool(boundary_pair_labels):
+                                        text_box = draw.textbbox(
+                                            text_position,
+                                            id_text,
+                                            font=font,
+                                            stroke_width=stroke_w,
+                                        )
+                                        pad = max(2, int(round(font_px * 0.12)))
+                                        draw.rounded_rectangle(
+                                            (
+                                                text_box[0] - pad,
+                                                text_box[1] - pad,
+                                                text_box[2] + pad,
+                                                text_box[3] + pad,
+                                            ),
+                                            radius=pad,
+                                            fill="white",
+                                            outline=rgb,
+                                            width=max(1, stroke_w),
+                                        )
                                     draw.text(
-                                        (cx_px - id_offset_x, cy_px - id_offset_y),
+                                        text_position,
                                         id_text,
                                         fill=rgb,
                                         font=font,
@@ -273,7 +360,8 @@ class AllCategoryAnnotationMixin:
                         # Baseline + height overlay: only for nanodroplet objects
                         # AND only when the tracker's focus category is nanodroplet
                         if (
-                            cat == "nanodroplet"
+                            not bool(boundary_pair_labels)
+                            and cat == "nanodroplet"
                             and str(self.target_category).lower() == "nanodroplet"
                             and nm_per_px is not None
                         ):

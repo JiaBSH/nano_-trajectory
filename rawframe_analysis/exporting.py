@@ -245,6 +245,139 @@ class CsvExportMixin:
                         ]
                     )
 
+        distance_paths = []
+        if self.compute_boundary_distances_enabled:
+            particle_ids_by_frame = self._tracked_category_ids(
+                self.boundary_particle_records,
+                max_dist=max_dist,
+                category=self.particle_category,
+            )
+            droplet_ids_by_frame = self._tracked_category_ids(
+                self.boundary_droplet_records,
+                max_dist=max_dist,
+                category=self.droplet_category,
+            )
+
+            def tracked_label(ids_by_frame, frame_id, frame_index, prefix):
+                ids = ids_by_frame.get(int(frame_id), [])
+                zero_based_index = int(frame_index) - 1
+                if zero_based_index < 0 or zero_based_index >= len(ids):
+                    raise ValueError(
+                        f"Missing tracked {prefix} ID for frame={frame_id}, "
+                        f"frame_index={frame_index}"
+                    )
+                return f"{prefix}{int(ids[zero_based_index])}"
+
+            particle_particle_path = os.path.join(
+                self.output_root,
+                f"{self.particle_category}_to_{self.particle_category}_boundary_distances.csv",
+            )
+            with open(particle_particle_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "frame_id",
+                        "frame_name",
+                        "nm_per_pixel",
+                        "particle_1_id",
+                        "particle_2_id",
+                        "boundary_distance_nm",
+                    ]
+                )
+                for row in self.particle_particle_distance_records:
+                    pair_ids = sorted(
+                        (
+                            tracked_label(particle_ids_by_frame, row[0], row[3], "P"),
+                            tracked_label(particle_ids_by_frame, row[0], row[5], "P"),
+                        ),
+                        key=lambda value: int(value[1:]),
+                    )
+                    writer.writerow(
+                        [
+                            int(row[0]),
+                            row[1],
+                            f"{float(row[2]):.6f}",
+                            pair_ids[0],
+                            pair_ids[1],
+                            f"{float(row[7]):.6f}",
+                        ]
+                    )
+            distance_paths.append(particle_particle_path)
+
+            particle_droplet_path = os.path.join(
+                self.output_root,
+                f"{self.particle_category}_to_{self.droplet_category}_boundary_distances.csv",
+            )
+            with open(particle_droplet_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "frame_id",
+                        "frame_name",
+                        "nm_per_pixel",
+                        "particle_id",
+                        "droplet_id",
+                        "boundary_distance_nm",
+                    ]
+                )
+                for row in self.particle_droplet_distance_records:
+                    writer.writerow(
+                        [
+                            int(row[0]),
+                            row[1],
+                            f"{float(row[2]):.6f}",
+                            tracked_label(particle_ids_by_frame, row[0], row[3], "P"),
+                            tracked_label(droplet_ids_by_frame, row[0], row[5], "D"),
+                            f"{float(row[7]):.6f}",
+                        ]
+                    )
+            distance_paths.append(particle_droplet_path)
+
+            nearest_path = os.path.join(
+                self.output_root,
+                f"{self.particle_category}_nearest_boundary_distances.csv",
+            )
+            with open(nearest_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(
+                    [
+                        "frame_id",
+                        "frame_name",
+                        "nm_per_pixel",
+                        "particle_id",
+                        "nearest_particle_id",
+                        "nearest_particle_boundary_distance_nm",
+                        "nearest_droplet_id",
+                        "nearest_droplet_boundary_distance_nm",
+                    ]
+                )
+                for row in self.particle_nearest_distance_records:
+                    writer.writerow(
+                        [
+                            int(row[0]),
+                            row[1],
+                            f"{float(row[2]):.6f}",
+                            tracked_label(particle_ids_by_frame, row[0], row[3], "P"),
+                            (
+                                ""
+                                if row[5] is None
+                                else tracked_label(
+                                    particle_ids_by_frame, row[0], row[5], "P"
+                                )
+                            ),
+                            "" if row[7] is None else f"{float(row[7]):.6f}",
+                            (
+                                ""
+                                if row[8] is None
+                                else tracked_label(
+                                    droplet_ids_by_frame, row[0], row[8], "D"
+                                )
+                            ),
+                            "" if row[10] is None else f"{float(row[10]):.6f}",
+                        ]
+                    )
+            distance_paths.append(nearest_path)
+
         print("Export finished:")
         print(f" - {path1}")
         print(f" - {path2}")
@@ -254,6 +387,8 @@ class CsvExportMixin:
             print(f" - {path5}")
         if path6 is not None:
             print(f" - {path6}")
+        for distance_path in distance_paths:
+            print(f" - {distance_path}")
 
     def export_tracked_area_results(self, tracks, out_csv=None):
         """Export tracked area series.
@@ -300,7 +435,7 @@ class CsvExportMixin:
 
         print(f" - {out_csv}")
 
-    def export_id_series(self, series_by_id, out_csv=None):
+    def export_id_series(self, series_by_id, out_csv=None, display_id_of=None):
         """Export area series keyed by a globally-incrementing instance id.
 
         CSV columns: instance_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
@@ -314,10 +449,15 @@ class CsvExportMixin:
 
         rows = []
         for instance_id, points in series_by_id.items():
+            exported_id = int(
+                instance_id
+                if display_id_of is None
+                else display_id_of.get(int(instance_id), int(instance_id))
+            )
             for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in points:
                 rows.append(
                     [
-                        int(instance_id),
+                        exported_id,
                         int(frame_id),
                         frame_name,
                         f"{float(nm_per_px):.6f}",
@@ -345,7 +485,9 @@ class CsvExportMixin:
 
         print(f" - {out_csv}")
 
-    def export_speed_series(self, speed_series_by_id, out_csv=None):
+    def export_speed_series(
+        self, speed_series_by_id, out_csv=None, display_id_of=None
+    ):
         """Export per-instance speed series (from centroid displacement).
 
         Speed is computed between consecutive detections of the same instance:
@@ -362,10 +504,15 @@ class CsvExportMixin:
 
         rows = []
         for instance_id, points in speed_series_by_id.items():
+            exported_id = int(
+                instance_id
+                if display_id_of is None
+                else display_id_of.get(int(instance_id), int(instance_id))
+            )
             for frame_id, frame_name, speed_nm_per_s in points:
                 rows.append(
                     [
-                        int(instance_id),
+                        exported_id,
                         int(frame_id),
                         frame_name,
                         f"{float(speed_nm_per_s):.6f}",

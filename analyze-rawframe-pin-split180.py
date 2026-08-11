@@ -44,6 +44,8 @@ class PinSplitGasTracker(GasTracker):
         self.split_records = []
         self.pin_line_records = []
         self._line_by_frame = {}
+        self.union_area_records = []
+        self.split_union_records = {}
 
     def _offset_label(self):
         magnitude = abs(float(self.split_offset_px))
@@ -68,6 +70,7 @@ class PinSplitGasTracker(GasTracker):
     def _empty_side_records():
         return {
             "area_records": [],
+            "union_area_records": [],
             "contour_records": [],
             "centroid_records": [],
             "object_records": [],
@@ -154,6 +157,8 @@ class PinSplitGasTracker(GasTracker):
         split_x_raw = line_info.get("split_x_raw_px")
         has_line = split_x_raw not in ("", None)
         split_x_raw_f = float(split_x_raw) if has_line else None
+        all_polygons = []
+        polygons_by_side = {"left": [], "right": []}
 
         for obj in data.get("objects", []):
             if obj.get("category") != self.gas_category:
@@ -213,6 +218,10 @@ class PinSplitGasTracker(GasTracker):
                 side_bucket["object_records"].append(object_record)
                 side_bucket["contour_records"].append(row)
 
+            all_polygons.append(pts_raw)
+            if side in polygons_by_side:
+                polygons_by_side[side].append(pts_raw)
+
             self.split_records.append(
                 {
                     "frame_id": int(frame_id),
@@ -239,6 +248,16 @@ class PinSplitGasTracker(GasTracker):
                     "height_nm": h_nm,
                 }
             )
+
+        self._record_frame_union_areas(
+            data=data,
+            frame_id=frame_id,
+            frame_name=frame_name,
+            nm_per_px=nm_per_px,
+            split_x_raw=split_x_raw_f,
+            all_polygons=all_polygons,
+            polygons_by_side=polygons_by_side,
+        )
 
     def _diameter_height_nm(self, pts, nm_per_px):
         try:
@@ -294,6 +313,127 @@ class PinSplitGasTracker(GasTracker):
             return 0.0
         area_px2 = self.polygon_area(clipped)
         return float(area_px2) * float(nm_per_px) * float(nm_per_px)
+
+    def _frame_raster_size(self, data, polygons):
+        info = data.get("info", {}) if isinstance(data, dict) else {}
+
+        def positive_int(value):
+            try:
+                result = int(round(float(value)))
+            except (TypeError, ValueError, OverflowError):
+                return None
+            return result if result > 0 else None
+
+        width = positive_int(info.get("width")) if isinstance(info, dict) else None
+        height = positive_int(info.get("height")) if isinstance(info, dict) else None
+        width = width or positive_int(self.W)
+        height = height or positive_int(self.H)
+
+        valid = [np.asarray(pts, dtype=np.float64) for pts in polygons if len(pts) >= 3]
+        if valid:
+            stacked = np.vstack(valid)
+            finite = stacked[np.all(np.isfinite(stacked[:, :2]), axis=1), :2]
+            if finite.size:
+                width = width or max(1, int(np.ceil(np.max(finite[:, 0]))) + 1)
+                height = height or max(1, int(np.ceil(np.max(finite[:, 1]))) + 1)
+
+        return width or 1, height or 1
+
+    @staticmethod
+    def _rasterize_polygon_union(polygons, width, height):
+        """Rasterize polygons into one binary mask so overlapping pixels count once."""
+        mask_image = Image.new("1", (int(width), int(height)), 0)
+        draw = ImageDraw.Draw(mask_image)
+        for pts in polygons:
+            pts = np.asarray(pts, dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[0] < 3 or pts.shape[1] < 2:
+                continue
+            pts = pts[:, :2]
+            if not np.all(np.isfinite(pts)):
+                continue
+            draw.polygon([tuple(map(float, point)) for point in pts], fill=1)
+        return np.asarray(mask_image, dtype=bool)
+
+    @staticmethod
+    def _area_from_pixel_count(pixel_count, nm_per_px):
+        return float(pixel_count) * float(nm_per_px) * float(nm_per_px)
+
+    def _record_frame_union_areas(
+        self,
+        data,
+        frame_id,
+        frame_name,
+        nm_per_px,
+        split_x_raw,
+        all_polygons,
+        polygons_by_side,
+    ):
+        width, height = self._frame_raster_size(data, all_polygons)
+        total_mask = self._rasterize_polygon_union(all_polygons, width, height)
+        total_area_nm2 = self._area_from_pixel_count(np.count_nonzero(total_mask), nm_per_px)
+
+        left_area_nm2 = 0.0
+        right_area_nm2 = 0.0
+        unknown_area_nm2 = 0.0
+        left_clipped_area_nm2 = 0.0
+        right_clipped_area_nm2 = 0.0
+
+        if split_x_raw is None:
+            unknown_area_nm2 = total_area_nm2
+        else:
+            pixel_centers_x = np.arange(width, dtype=np.float64) + 0.5
+            left_columns = pixel_centers_x < float(split_x_raw)
+            right_columns = ~left_columns
+
+            left_clipped_area_nm2 = self._area_from_pixel_count(
+                np.count_nonzero(total_mask[:, left_columns]), nm_per_px
+            )
+            right_clipped_area_nm2 = self._area_from_pixel_count(
+                np.count_nonzero(total_mask[:, right_columns]), nm_per_px
+            )
+
+            left_side_mask = self._rasterize_polygon_union(
+                polygons_by_side["left"], width, height
+            )
+            right_side_mask = self._rasterize_polygon_union(
+                polygons_by_side["right"], width, height
+            )
+
+            # If centroid-classified left/right instances overlap, assign each shared
+            # pixel according to its physical side of the split line. This preserves
+            # the centroid-side metric while keeping left + right free of double counts.
+            overlap = left_side_mask & right_side_mask
+            left_owned = (left_side_mask & ~overlap) | (overlap & left_columns[None, :])
+            right_owned = (right_side_mask & ~overlap) | (overlap & right_columns[None, :])
+            left_area_nm2 = self._area_from_pixel_count(
+                np.count_nonzero(left_owned), nm_per_px
+            )
+            right_area_nm2 = self._area_from_pixel_count(
+                np.count_nonzero(right_owned), nm_per_px
+            )
+
+        union_record = [
+            int(frame_id),
+            str(frame_name),
+            float(nm_per_px),
+            total_area_nm2,
+        ]
+        self.union_area_records.append(union_record)
+        self.side_records["left"]["union_area_records"].append(
+            [int(frame_id), str(frame_name), float(nm_per_px), left_area_nm2]
+        )
+        self.side_records["right"]["union_area_records"].append(
+            [int(frame_id), str(frame_name), float(nm_per_px), right_area_nm2]
+        )
+        self.split_union_records[int(frame_id)] = {
+            "left_area_nm2": left_area_nm2,
+            "right_area_nm2": right_area_nm2,
+            "unknown_area_nm2": unknown_area_nm2,
+            "left_clipped_area_nm2": left_clipped_area_nm2,
+            "right_clipped_area_nm2": right_clipped_area_nm2,
+            "total_area_nm2": total_area_nm2,
+            "total_clipped_area_nm2": left_clipped_area_nm2 + right_clipped_area_nm2,
+        }
 
     def export_split_results(self, max_dist=50.0, id_mode="event", use_display_id=True):
         self._export_pin_line_records()
@@ -389,20 +529,17 @@ class PinSplitGasTracker(GasTracker):
         for rec in self.split_records:
             fid = int(rec["frame_id"])
             side = str(rec["side_by_centroid"])
-            area = float(rec["area_nm2"])
             if side == "left":
                 stats[fid]["left_count"] += 1
-                stats[fid]["left_area_nm2"] += area
             elif side == "right":
                 stats[fid]["right_count"] += 1
-                stats[fid]["right_area_nm2"] += area
             else:
                 stats[fid]["unknown_count"] += 1
-                stats[fid]["unknown_area_nm2"] += area
 
-            stats[fid]["left_clipped_area_nm2"] += self._safe_float(rec["clipped_left_area_nm2"])
-            stats[fid]["right_clipped_area_nm2"] += self._safe_float(rec["clipped_right_area_nm2"])
             stats[fid]["crossing_count"] += int(rec["crosses_split_line"])
+
+        for fid, union_stats in self.split_union_records.items():
+            stats[int(fid)].update(union_stats)
 
         path = os.path.join(self.output_root, f"{self.gas_category}_pin_split_frame_comparison.csv")
         fields = [
@@ -442,8 +579,14 @@ class PinSplitGasTracker(GasTracker):
                 pin = pin_by_frame[fid]
                 st = stats[fid]
                 total_count = st["left_count"] + st["right_count"] + st["unknown_count"]
-                total_area = st["left_area_nm2"] + st["right_area_nm2"] + st["unknown_area_nm2"]
-                total_clipped = st["left_clipped_area_nm2"] + st["right_clipped_area_nm2"]
+                total_area = st.get(
+                    "total_area_nm2",
+                    st["left_area_nm2"] + st["right_area_nm2"] + st["unknown_area_nm2"],
+                )
+                total_clipped = st.get(
+                    "total_clipped_area_nm2",
+                    st["left_clipped_area_nm2"] + st["right_clipped_area_nm2"],
+                )
                 writer.writerow(
                     {
                         "frame_id": fid,
@@ -553,6 +696,50 @@ class PinSplitGasTracker(GasTracker):
         plt.close(fig)
         print(f"Saved split difference plot: {diff_path}")
 
+    def _area_records_with_union_totals(self):
+        """Keep one row per instance while replacing each frame sum with union area."""
+        union_by_frame = {
+            int(frame_id): float(area_nm2)
+            for frame_id, _frame_name, _nm_per_px, area_nm2 in self.union_area_records
+        }
+        if not union_by_frame:
+            return list(self.area_records)
+
+        assigned_frames = set()
+        adjusted = []
+        for frame_id, frame_name, nm_per_px, area_nm2 in self.area_records:
+            fid = int(frame_id)
+            if fid not in union_by_frame:
+                adjusted_area = float(area_nm2)
+            elif fid not in assigned_frames:
+                adjusted_area = union_by_frame[fid]
+                assigned_frames.add(fid)
+            else:
+                adjusted_area = 0.0
+            adjusted.append([fid, frame_name, nm_per_px, adjusted_area])
+        return adjusted
+
+    def plot_frame_instance_count_and_total_area(self, *args, **kwargs):
+        original_area_records = self.area_records
+        self.area_records = self._area_records_with_union_totals()
+        try:
+            return super().plot_frame_instance_count_and_total_area(*args, **kwargs)
+        finally:
+            self.area_records = original_area_records
+
+    def plot_area_delta_vs_frame(self, *args, **kwargs):
+        reducer = args[3] if len(args) >= 4 else kwargs.get("reducer", "sum")
+        reducer = str(reducer).strip().lower()
+        if reducer != "sum":
+            return super().plot_area_delta_vs_frame(*args, **kwargs)
+
+        original_area_records = self.area_records
+        self.area_records = self._area_records_with_union_totals()
+        try:
+            return super().plot_area_delta_vs_frame(*args, **kwargs)
+        finally:
+            self.area_records = original_area_records
+
     def export_side_analyses(
         self,
         max_dist=50.0,
@@ -598,6 +785,7 @@ class PinSplitGasTracker(GasTracker):
     def _capture_record_context(self):
         return {
             "area_records": self.area_records,
+            "union_area_records": self.union_area_records,
             "contour_records": self.contour_records,
             "centroid_records": self.centroid_records,
             "object_records": self.object_records,
@@ -606,6 +794,7 @@ class PinSplitGasTracker(GasTracker):
 
     def _restore_record_context(self, ctx):
         self.area_records = ctx["area_records"]
+        self.union_area_records = ctx["union_area_records"]
         self.contour_records = ctx["contour_records"]
         self.centroid_records = ctx["centroid_records"]
         self.object_records = ctx["object_records"]
@@ -614,6 +803,7 @@ class PinSplitGasTracker(GasTracker):
     def _apply_side_context(self, side, output_root, category_name):
         rec = self.side_records[side]
         self.area_records = rec["area_records"]
+        self.union_area_records = rec["union_area_records"]
         self.contour_records = rec["contour_records"]
         self.centroid_records = rec["centroid_records"]
         self.object_records = rec["object_records"]
@@ -751,9 +941,9 @@ def parse_args():
     )
     parser.add_argument(
         "--json-dir",
-        default=r"D:\code\zwl_NANO\outputs\zwl_roi_crops_blue_yellow_1024_tvl1_lam05_sharp\lable3100-7400_forward_fullsize",
+        default=r"d:\code\zwl_NANO\outputs\zwl2_stage_instance_nc_v7_imagenet_fp32_20260807\delivery\mask2former_v7\fullframe\mask2former_r50_zwl2_stage_instance_nc_v7_imagenet_fp32\predictions_isat",
     )
-    parser.add_argument("--raw-frame-dir", default=r"D:\code\zwl_NANO\data\zwl")
+    parser.add_argument("--raw-frame-dir", default=r"D:\code\nanojccode\data\zwl\zwl2\frame")
     parser.add_argument(
         "--scale-csv",
         default=r"D:\code\zwl_NANO\outputs\zwl_scale_bar_detection\scalebar_for_analyze_rawframe.csv",
@@ -769,7 +959,7 @@ def parse_args():
     parser.add_argument("--no-strict-scale-match", dest="strict_scale_match", action="store_false")
     parser.add_argument("--visualize-raw-frames", dest="visualize_raw_frames", action="store_true", default=True)
     parser.add_argument("--no-visualize-raw-frames", dest="visualize_raw_frames", action="store_false")
-    parser.add_argument("--visualization-frame-step", type=int, default=100)
+    parser.add_argument("--visualization-frame-step", type=int, default=500)
     parser.add_argument("--evolution-step", type=int, default=2)
     parser.add_argument("--max-dist", type=float, default=20.0)
     parser.add_argument("--min-track-length", type=int, default=0)

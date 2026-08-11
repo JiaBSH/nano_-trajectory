@@ -8,13 +8,95 @@ import numpy as np
 class ObjectTrackingMixin:
     """Provide cross-frame object association and derived time-series helpers."""
 
+    def _tracked_category_ids(self, records, max_dist, category=None):
+        """Return compact tracked IDs aligned with each frame's record order.
+
+        When ``category`` is the analysis target and the per-frame record counts
+        match, reuse the canonical object-record assignments.  This is what
+        keeps, for example, ``D3`` in a boundary-distance plot equal to
+        ``instance_id == 3`` in the centroid and speed CSV files.
+        """
+        from collections import defaultdict
+
+        normalized_category = (
+            str(category).strip().lower() if category is not None else None
+        )
+        normalized_target = str(getattr(self, "target_category", "")).strip().lower()
+        if normalized_category and normalized_category == normalized_target:
+            series_by_id, assigned_ids_by_frame, _events = (
+                self._event_id_series_for_object_records(max_dist=max_dist)
+            )
+            record_counts = defaultdict(int)
+            for row in records:
+                record_counts[int(row[0])] += 1
+            frames = set(record_counts) | set(assigned_ids_by_frame)
+            counts_match = all(
+                int(record_counts.get(frame_id, 0))
+                == len(assigned_ids_by_frame.get(frame_id, []))
+                for frame_id in frames
+            )
+            if counts_match:
+                display_id_of = self._display_id_mapping(series_by_id)
+                return {
+                    int(frame_id): [
+                        int(display_id_of.get(int(instance_id), int(instance_id)))
+                        for instance_id in instance_ids
+                    ]
+                    for frame_id, instance_ids in assigned_ids_by_frame.items()
+                }
+
+        # Empty frames participate so identities are not linked across a frame
+        # where the category was absent or the frame itself was skipped.
+        detections_by_frame = defaultdict(
+            list, {frame_id: [] for frame_id in range(len(self.json_files))}
+        )
+        for row in records:
+            detections_by_frame[int(row[0])].append(
+                (
+                    str(row[1]),
+                    float(row[2]),
+                    float(row[5]),
+                    float(row[6]),
+                    float(row[7]),
+                )
+            )
+        series_by_id, assigned_ids_by_frame, _events = (
+            self._build_event_id_series_with_assignments(
+                detections_by_frame, max_dist=max_dist
+            )
+        )
+        display_id_of = self._display_id_mapping(series_by_id)
+        return {
+            int(frame_id): [
+                int(display_id_of.get(int(instance_id), int(instance_id)))
+                for instance_id in instance_ids
+            ]
+            for frame_id, instance_ids in assigned_ids_by_frame.items()
+        }
+
     def _object_detections_by_frame(self):
-        if self._object_detections_by_frame_cache is not None:
+        record_count = len(self.object_records)
+        cache_matches_records = (
+            self._object_detections_by_frame_cache_records is self.object_records
+            and self._object_detections_by_frame_cache_record_count == record_count
+        )
+        if self._object_detections_by_frame_cache is not None and cache_matches_records:
             return self._object_detections_by_frame_cache
 
         from collections import defaultdict
 
-        by_frame = defaultdict(list)
+        record_frame_ids = {int(row[0]) for row in self.object_records}
+        json_files = getattr(self, "json_files", None)
+        if json_files is not None:
+            frame_ids = set(range(len(json_files))) | record_frame_ids
+        elif record_frame_ids:
+            frame_ids = set(range(min(record_frame_ids), max(record_frame_ids) + 1))
+        else:
+            frame_ids = set()
+
+        # Include empty frames so an identity cannot jump across a frame in
+        # which the object was absent.
+        by_frame = defaultdict(list, {frame_id: [] for frame_id in frame_ids})
         for (
             frame_id,
             frame_name,
@@ -34,16 +116,22 @@ class ObjectTrackingMixin:
             )
 
         self._object_detections_by_frame_cache = by_frame
+        self._object_detections_by_frame_cache_records = self.object_records
+        self._object_detections_by_frame_cache_record_count = record_count
+        # Event IDs are derived from the same records, so none of the results
+        # cached for a previous full/side record context remain valid here.
+        self._event_id_series_cache = {}
         return by_frame
 
     def _event_id_series_for_object_records(self, max_dist=50.0):
-        key = (len(self.object_records), float(max_dist))
+        detections_by_frame = self._object_detections_by_frame()
+        key = float(max_dist)
         cached = self._event_id_series_cache.get(key)
         if cached is not None:
             return cached
 
         result = self._build_event_id_series_with_assignments(
-            self._object_detections_by_frame(),
+            detections_by_frame,
             max_dist=max_dist,
         )
         self._event_id_series_cache[key] = result
@@ -128,6 +216,21 @@ class ObjectTrackingMixin:
             first_frame_by_id.keys(), key=lambda i: (first_frame_by_id[i], i)
         )
         return {iid: idx + 1 for idx, iid in enumerate(ordered_ids)}
+
+    def _category_id_prefix(self, category=None):
+        """Return the short prefix shared by plots and pair annotations."""
+        normalized = str(
+            self.target_category if category is None else category
+        ).strip().lower()
+        if normalized == str(getattr(self, "particle_category", "")).strip().lower():
+            return "P"
+        if normalized == str(getattr(self, "droplet_category", "")).strip().lower():
+            return "D"
+        return ""
+
+    def _format_category_display_id(self, display_id, category=None):
+        """Format a compact display ID consistently, e.g. P2 or D7."""
+        return f"{self._category_id_prefix(category)}{int(display_id)}"
 
     @staticmethod
     def _select_plot_instance_ids(series_by_id, max_plot_tracks=None):

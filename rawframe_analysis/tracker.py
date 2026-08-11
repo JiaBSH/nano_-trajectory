@@ -9,6 +9,7 @@ import numpy as np
 from PIL import Image
 
 from .annotations import AnnotationMixin
+from .boundary_distance_plots import BoundaryDistancePlotMixin
 from .exporting import CsvExportMixin
 from .geometry import GeometryMixin
 from .inputs import InputMixin
@@ -27,6 +28,7 @@ class GasTracker(
     CsvExportMixin,
     AnnotationMixin,
     PlotStyleMixin,
+    BoundaryDistancePlotMixin,
     TrajectoryPlotMixin,
     SummaryPlotMixin,
 ):
@@ -51,6 +53,9 @@ class GasTracker(
         compute_diameter_height_enabled=True,
         output_root=None,
         gas_category=None,
+        compute_boundary_distances_enabled=False,
+        particle_category="nanocluster",
+        droplet_category="nanodroplet",
     ):
         target_category = self._resolve_legacy_category(
             target_category=target_category,
@@ -70,6 +75,9 @@ class GasTracker(
             max_particle_pin_distance_nm=max_particle_pin_distance_nm,
             fastplot_enabled=fastplot_enabled,
             compute_diameter_height_enabled=compute_diameter_height_enabled,
+            compute_boundary_distances_enabled=compute_boundary_distances_enabled,
+            particle_category=particle_category,
+            droplet_category=droplet_category,
         )
         self._initialize_run_state()
         self._prepare_output_directory(output_root)
@@ -96,6 +104,9 @@ class GasTracker(
         max_particle_pin_distance_nm,
         fastplot_enabled,
         compute_diameter_height_enabled,
+        compute_boundary_distances_enabled,
+        particle_category,
+        droplet_category,
     ):
         """Normalize constructor arguments into stable tracker options."""
         self.json_dir = json_dir
@@ -114,6 +125,15 @@ class GasTracker(
         )
         self.fastplot_enabled = bool(fastplot_enabled)
         self.compute_diameter_height_enabled = bool(compute_diameter_height_enabled)
+        self.compute_boundary_distances_enabled = bool(
+            compute_boundary_distances_enabled
+        )
+        self.particle_category = str(particle_category).strip()
+        self.droplet_category = str(droplet_category).strip()
+        if not self.particle_category or not self.droplet_category:
+            raise ValueError("particle_category and droplet_category must be non-empty")
+        if self.particle_category == self.droplet_category:
+            raise ValueError("particle_category and droplet_category must be different")
 
     @staticmethod
     def _resolve_legacy_category(*, target_category, gas_category):
@@ -152,6 +172,8 @@ class GasTracker(
         self.skipped_no_pin_frames = 0
         self.processed_frame_count = 0
         self._object_detections_by_frame_cache = None
+        self._object_detections_by_frame_cache_records = None
+        self._object_detections_by_frame_cache_record_count = 0
         self._event_id_series_cache = {}
 
     def _prepare_output_directory(self, output_root):
@@ -213,6 +235,11 @@ class GasTracker(
         self.centroid_records = []
         self.object_records = []
         self.diameter_height_records = []
+        self.particle_particle_distance_records = []
+        self.particle_droplet_distance_records = []
+        self.particle_nearest_distance_records = []
+        self.boundary_particle_records = []
+        self.boundary_droplet_records = []
 
     def _initialize_spatial_reference(self):
         self.ref_pin_centroid = None

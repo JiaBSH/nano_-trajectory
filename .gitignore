@@ -3,3 +3,4 @@ result/
 yolo_code/runs/
 __pycache__/
 *.pyc
+nano*

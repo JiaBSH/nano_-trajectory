@@ -41,6 +41,7 @@ class AreaTrajectoryPlotMixin:
                 f"id_mode={id_mode}, max_dist_nm={float(max_dist)}, min_track_length={int(min_track_length)}"
             )
 
+        display_id_of = None
         if str(id_mode).lower() == "greedy":
             tracks = self._build_greedy_tracks(by_frame, max_dist=max_dist)
             if bool(debug_stats):
@@ -58,21 +59,25 @@ class AreaTrajectoryPlotMixin:
                 ]
                 for track_id, t in enumerate(tracks)
             }
+            display_id_of = self._display_id_mapping(series_by_id)
         else:
             if by_frame is self._object_detections_by_frame():
-                series_by_id, _assigned_ids_by_frame, _events = (
+                full_series_by_id, _assigned_ids_by_frame, _events = (
                     self._event_id_series_for_object_records(max_dist=max_dist)
                 )
             else:
-                series_by_id, _events = self._build_event_id_series(
+                full_series_by_id, _events = self._build_event_id_series(
                     by_frame, max_dist=max_dist
                 )
+            display_id_of = self._display_id_mapping(full_series_by_id)
             if bool(debug_stats):
                 print(
-                    f"[debug] {self.target_category} area: event ids before length filter={len(series_by_id)}"
+                    f"[debug] {self.target_category} area: event ids before length filter={len(full_series_by_id)}"
                 )
             series_by_id = {
-                k: v for k, v in series_by_id.items() if len(v) >= int(min_track_length)
+                k: v
+                for k, v in full_series_by_id.items()
+                if len(v) >= int(min_track_length)
             }
             if bool(debug_stats):
                 kept = len(series_by_id)
@@ -107,7 +112,6 @@ class AreaTrajectoryPlotMixin:
             self._positive_plot_limit(annotate_ids_max) if fastplot_enabled else None
         )
 
-        display_id_of = self._display_id_mapping(series_by_id)
         instance_ids, total_instance_ids = self._select_plot_instance_ids(
             series_by_id,
             max_plot_tracks=plot_max_tracks,
@@ -146,7 +150,9 @@ class AreaTrajectoryPlotMixin:
             color = cmap(int(disp_id) % 20)
             (line,) = ax.plot(frames, areas, color=color, linewidth=1.2, alpha=0.85)
             line_handles.append(line)
-            line_id_label = str(int(disp_id) if disp_id > 0 else int(instance_id))
+            line_id_label = self._format_category_display_id(
+                int(disp_id) if disp_id > 0 else int(instance_id)
+            )
             line_labels.append(line_id_label)
 
             if annotate_max is None or len(instance_ids) <= int(annotate_max):
@@ -261,4 +267,4 @@ class AreaTrajectoryPlotMixin:
         if str(id_mode).lower() == "greedy":
             self.export_tracked_area_results(tracks)
         else:
-            self.export_id_series(series_by_id)
+            self.export_id_series(series_by_id, display_id_of=display_id_of)

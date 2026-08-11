@@ -56,6 +56,9 @@ class FrameProcessingMixin:
                 shift = self._compute_pin_shift(data)
 
             self._process_target_objects(data, frame_id, frame_name, nm_per_px, shift)
+            self._process_boundary_distances(
+                data, frame_id, frame_name, nm_per_px, shift
+            )
             self.processed_frame_count += 1
 
         if self.pin_reference_enabled:
@@ -68,6 +71,158 @@ class FrameProcessingMixin:
                     f"[pin] filtered {self.filtered_far_particle_count} {self.target_category} objects farther than "
                     f"{self.max_particle_pin_distance_nm:.6f} nm from pin centroid."
                 )
+
+    def _category_polygons(self, data, category, shift):
+        """Return valid category polygons with frame-local and JSON indices."""
+        polygons = []
+        for json_object_index, obj in enumerate(data.get("objects", [])):
+            if obj.get("category") != category:
+                continue
+            points = np.asarray(obj.get("segmentation"), dtype=np.float64)
+            if (
+                points.ndim != 2
+                or points.shape[0] < 3
+                or points.shape[1] < 2
+                or not np.all(np.isfinite(points[:, :2]))
+            ):
+                continue
+            tracking_points = points[:, :2] - np.asarray(shift, dtype=np.float64)
+            centroid, area_px2 = self.polygon_centroid(tracking_points)
+            if centroid is None:
+                centroid = tracking_points.mean(axis=0)
+            polygons.append(
+                {
+                    "frame_index": len(polygons) + 1,
+                    "json_object_index": int(json_object_index),
+                    "points": points[:, :2],
+                    "tracking_centroid_px": centroid,
+                    "area_px2": float(area_px2),
+                }
+            )
+        return polygons
+
+    def _process_boundary_distances(self, data, frame_id, frame_name, nm_per_px, shift):
+        if not self.compute_boundary_distances_enabled:
+            return
+
+        particles = self._category_polygons(data, self.particle_category, shift)
+        droplets = self._category_polygons(data, self.droplet_category, shift)
+        nearest_particles = [None] * len(particles)
+        nearest_droplets = [None] * len(particles)
+        scale = float(nm_per_px)
+
+        for record_buffer, objects in (
+            (self.boundary_particle_records, particles),
+            (self.boundary_droplet_records, droplets),
+        ):
+            for obj in objects:
+                centroid = obj["tracking_centroid_px"]
+                record_buffer.append(
+                    [
+                        int(frame_id),
+                        frame_name,
+                        scale,
+                        obj["frame_index"],
+                        obj["json_object_index"],
+                        float(centroid[0]) * scale,
+                        float(centroid[1]) * scale,
+                        float(obj["area_px2"]) * scale * scale,
+                    ]
+                )
+
+        for first_index, first in enumerate(particles):
+            for second_index in range(first_index + 1, len(particles)):
+                second = particles[second_index]
+                distance_nm = (
+                    self.polygon_boundary_distance(first["points"], second["points"])
+                    * scale
+                )
+                self.particle_particle_distance_records.append(
+                    [
+                        int(frame_id),
+                        frame_name,
+                        scale,
+                        first["frame_index"],
+                        first["json_object_index"],
+                        second["frame_index"],
+                        second["json_object_index"],
+                        float(distance_nm),
+                    ]
+                )
+                candidate_for_first = (float(distance_nm), second)
+                candidate_for_second = (float(distance_nm), first)
+                if (
+                    nearest_particles[first_index] is None
+                    or candidate_for_first[0] < nearest_particles[first_index][0]
+                ):
+                    nearest_particles[first_index] = candidate_for_first
+                if (
+                    nearest_particles[second_index] is None
+                    or candidate_for_second[0] < nearest_particles[second_index][0]
+                ):
+                    nearest_particles[second_index] = candidate_for_second
+
+        for particle_index, particle in enumerate(particles):
+            for droplet in droplets:
+                distance_nm = (
+                    self.polygon_boundary_distance(
+                        particle["points"], droplet["points"]
+                    )
+                    * scale
+                )
+                self.particle_droplet_distance_records.append(
+                    [
+                        int(frame_id),
+                        frame_name,
+                        scale,
+                        particle["frame_index"],
+                        particle["json_object_index"],
+                        droplet["frame_index"],
+                        droplet["json_object_index"],
+                        float(distance_nm),
+                    ]
+                )
+                candidate = (float(distance_nm), droplet)
+                if (
+                    nearest_droplets[particle_index] is None
+                    or candidate[0] < nearest_droplets[particle_index][0]
+                ):
+                    nearest_droplets[particle_index] = candidate
+
+        for particle_index, particle in enumerate(particles):
+            nearest_particle = nearest_particles[particle_index]
+            nearest_droplet = nearest_droplets[particle_index]
+            self.particle_nearest_distance_records.append(
+                [
+                    int(frame_id),
+                    frame_name,
+                    scale,
+                    particle["frame_index"],
+                    particle["json_object_index"],
+                    (
+                        None
+                        if nearest_particle is None
+                        else nearest_particle[1]["frame_index"]
+                    ),
+                    (
+                        None
+                        if nearest_particle is None
+                        else nearest_particle[1]["json_object_index"]
+                    ),
+                    None if nearest_particle is None else nearest_particle[0],
+                    (
+                        None
+                        if nearest_droplet is None
+                        else nearest_droplet[1]["frame_index"]
+                    ),
+                    (
+                        None
+                        if nearest_droplet is None
+                        else nearest_droplet[1]["json_object_index"]
+                    ),
+                    None if nearest_droplet is None else nearest_droplet[0],
+                ]
+            )
 
     def _compute_pin_centroid(self, data):
         weighted_sum = np.zeros(2, dtype=np.float64)

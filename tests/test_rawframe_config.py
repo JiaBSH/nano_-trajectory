@@ -65,6 +65,16 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_tracking_distance_must_match_across_outputs(self):
+        with self.assertRaisesRegex(ConfigError, "object IDs stay consistent"):
+            RawFrameConfig.from_dict(
+                {
+                    "input": {"json_dir": "annotations"},
+                    "output": {"export_max_dist_nm": 50.0},
+                    "plots": {"max_dist_nm": 20.0},
+                }
+            )
+
     def test_category_drives_default_output_names(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "experiment.json"

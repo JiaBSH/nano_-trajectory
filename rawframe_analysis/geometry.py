@@ -9,6 +9,167 @@ class GeometryMixin:
     """Provide polygon and droplet geometry calculations."""
 
     @staticmethod
+    def polygon_boundary_distance(polygon_a, polygon_b):
+        """Return the shortest distance between two filled polygons.
+
+        The result uses the same coordinate unit as the inputs.  Intersecting,
+        touching, or nested polygons have distance zero; otherwise the result is
+        the minimum Euclidean distance between their closed boundaries.
+        """
+        a = GeometryMixin._distance_polygon_points(polygon_a, "polygon_a")
+        b = GeometryMixin._distance_polygon_points(polygon_b, "polygon_b")
+        coordinate_scale = max(
+            1.0,
+            float(np.max(np.abs(a))),
+            float(np.max(np.abs(b))),
+        )
+        tolerance = 1e-9 * coordinate_scale
+
+        a_min, a_max = np.min(a, axis=0), np.max(a, axis=0)
+        b_min, b_max = np.min(b, axis=0), np.max(b, axis=0)
+        bounding_boxes_overlap = bool(
+            np.all(a_max >= b_min - tolerance) and np.all(b_max >= a_min - tolerance)
+        )
+        if bounding_boxes_overlap:
+            if GeometryMixin._polygon_boundaries_intersect(a, b, tolerance):
+                return 0.0
+
+            # If boundaries do not cross, overlap can only occur by containment.
+            if GeometryMixin._point_in_filled_polygon(a[0], b, tolerance) or (
+                GeometryMixin._point_in_filled_polygon(b[0], a, tolerance)
+            ):
+                return 0.0
+
+        distance = min(
+            GeometryMixin._vertices_to_boundary_distance(a, b),
+            GeometryMixin._vertices_to_boundary_distance(b, a),
+        )
+        return 0.0 if distance <= tolerance else float(distance)
+
+    @staticmethod
+    def _distance_polygon_points(polygon, name):
+        points = np.asarray(polygon, dtype=np.float64)
+        if points.ndim != 2 or points.shape[1] < 2 or points.shape[0] < 3:
+            raise ValueError(f"{name} must contain at least three 2-D points")
+        points = points[:, :2]
+        if not np.all(np.isfinite(points)):
+            raise ValueError(f"{name} contains non-finite coordinates")
+        if points.shape[0] > 3 and np.allclose(
+            points[0], points[-1], rtol=0.0, atol=1e-12
+        ):
+            points = points[:-1]
+        return points
+
+    @staticmethod
+    def _cross_2d(left, right):
+        return left[..., 0] * right[..., 1] - left[..., 1] * right[..., 0]
+
+    @staticmethod
+    def _polygon_boundaries_intersect(a, b, tolerance):
+        """Vectorized segment-intersection test for two closed boundaries."""
+        b_start = b
+        b_end = np.roll(b, -1, axis=0)
+        b_vec = b_end - b_start
+
+        for a_start, a_end in zip(a, np.roll(a, -1, axis=0)):
+            a_vec = a_end - a_start
+            orient_b_start = GeometryMixin._cross_2d(a_vec, b_start - a_start)
+            orient_b_end = GeometryMixin._cross_2d(a_vec, b_end - a_start)
+            orient_a_start = GeometryMixin._cross_2d(b_vec, a_start - b_start)
+            orient_a_end = GeometryMixin._cross_2d(b_vec, a_end - b_start)
+
+            crosses_a = ((orient_b_start > tolerance) & (orient_b_end < -tolerance)) | (
+                (orient_b_start < -tolerance) & (orient_b_end > tolerance)
+            )
+            crosses_b = ((orient_a_start > tolerance) & (orient_a_end < -tolerance)) | (
+                (orient_a_start < -tolerance) & (orient_a_end > tolerance)
+            )
+            if np.any(crosses_a & crosses_b):
+                return True
+
+            # Include endpoint contact and collinear overlap.
+            for point, orientation in (
+                (b_start, orient_b_start),
+                (b_end, orient_b_end),
+            ):
+                on_line = np.abs(orientation) <= tolerance
+                in_x = (point[:, 0] >= min(a_start[0], a_end[0]) - tolerance) & (
+                    point[:, 0] <= max(a_start[0], a_end[0]) + tolerance
+                )
+                in_y = (point[:, 1] >= min(a_start[1], a_end[1]) - tolerance) & (
+                    point[:, 1] <= max(a_start[1], a_end[1]) + tolerance
+                )
+                if np.any(on_line & in_x & in_y):
+                    return True
+
+            a_start_on_b = (
+                (np.abs(orient_a_start) <= tolerance)
+                & (a_start[0] >= np.minimum(b_start[:, 0], b_end[:, 0]) - tolerance)
+                & (a_start[0] <= np.maximum(b_start[:, 0], b_end[:, 0]) + tolerance)
+                & (a_start[1] >= np.minimum(b_start[:, 1], b_end[:, 1]) - tolerance)
+                & (a_start[1] <= np.maximum(b_start[:, 1], b_end[:, 1]) + tolerance)
+            )
+            a_end_on_b = (
+                (np.abs(orient_a_end) <= tolerance)
+                & (a_end[0] >= np.minimum(b_start[:, 0], b_end[:, 0]) - tolerance)
+                & (a_end[0] <= np.maximum(b_start[:, 0], b_end[:, 0]) + tolerance)
+                & (a_end[1] >= np.minimum(b_start[:, 1], b_end[:, 1]) - tolerance)
+                & (a_end[1] <= np.maximum(b_start[:, 1], b_end[:, 1]) + tolerance)
+            )
+            if np.any(a_start_on_b | a_end_on_b):
+                return True
+        return False
+
+    @staticmethod
+    def _point_in_filled_polygon(point, polygon, tolerance):
+        starts = polygon
+        ends = np.roll(polygon, -1, axis=0)
+        edge = ends - starts
+        edge_length_sq = np.einsum("ij,ij->i", edge, edge)
+        projection = np.zeros_like(edge_length_sq)
+        nonzero = edge_length_sq > 0.0
+        projection[nonzero] = (
+            np.einsum("ij,ij->i", point - starts[nonzero], edge[nonzero])
+            / edge_length_sq[nonzero]
+        )
+        projection = np.clip(projection, 0.0, 1.0)
+        closest = starts + projection[:, None] * edge
+        if float(np.min(np.linalg.norm(closest - point, axis=1))) <= tolerance:
+            return True
+
+        y = float(point[1])
+        x = float(point[0])
+        crosses_y = (starts[:, 1] > y) != (ends[:, 1] > y)
+        safe_denominator = np.where(crosses_y, ends[:, 1] - starts[:, 1], 1.0)
+        crossing_x = starts[:, 0] + (y - starts[:, 1]) * edge[:, 0] / safe_denominator
+        return bool(np.count_nonzero(crosses_y & (x < crossing_x)) % 2)
+
+    @staticmethod
+    def _vertices_to_boundary_distance(vertices, boundary):
+        starts = boundary
+        edge = np.roll(boundary, -1, axis=0) - starts
+        edge_length_sq = np.einsum("ij,ij->i", edge, edge)
+        best = np.inf
+        # Cap temporary arrays at roughly one million vertex-edge combinations.
+        chunk_size = max(1, 1_000_000 // max(1, len(boundary)))
+        for chunk_start in range(0, len(vertices), chunk_size):
+            chunk = vertices[chunk_start : chunk_start + chunk_size]
+            point_to_start = chunk[:, None, :] - starts[None, :, :]
+            projection = np.divide(
+                np.einsum("cbi,bi->cb", point_to_start, edge),
+                edge_length_sq[None, :],
+                out=np.zeros((len(chunk), len(boundary)), dtype=np.float64),
+                where=edge_length_sq[None, :] > 0.0,
+            )
+            projection = np.clip(projection, 0.0, 1.0)
+            residual = point_to_start - projection[:, :, None] * edge[None, :, :]
+            best = min(
+                best,
+                float(np.sqrt(np.min(np.einsum("cbi,cbi->cb", residual, residual)))),
+            )
+        return best
+
+    @staticmethod
     def _compute_droplet_dims_oriented(pts):
         """
         Compute droplet diameter/height from a fitted contact line on the original contour.

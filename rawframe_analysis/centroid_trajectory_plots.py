@@ -12,7 +12,9 @@ from matplotlib.colors import Normalize
 class CentroidTrajectoryPlotMixin:
     """Provide centroid trajectory visualization."""
 
-    def plot_centroid_trajectories(self, max_dist=50.0, max_fastplot_points=100000):
+    def plot_centroid_trajectories(
+        self, max_dist=50.0, max_fastplot_points=100000, annotate_ids_max=80
+    ):
         """
         Build simple greedy tracks by linking centroids in consecutive frames
         when their distance is <= max_dist. Save plot to PNG.
@@ -21,6 +23,11 @@ class CentroidTrajectoryPlotMixin:
         if len(self.centroid_records) == 0:
             print("No centroid records to plot.")
             return
+
+        series_by_id, _assigned_ids_by_frame, _events = (
+            self._event_id_series_for_object_records(max_dist=max_dist)
+        )
+        display_id_of = self._display_id_mapping(series_by_id)
 
         fastplot_enabled = bool(getattr(self, "fastplot_enabled", True))
         if fastplot_enabled:
@@ -52,6 +59,28 @@ class CentroidTrajectoryPlotMixin:
             ax.scatter(
                 xs, ys, c=frames, cmap=cmap, norm=norm, s=1, linewidths=0, alpha=0.9
             )
+
+            annotate_limit = self._positive_plot_limit(annotate_ids_max)
+            if annotate_limit is None or len(series_by_id) <= annotate_limit:
+                for instance_id, points in series_by_id.items():
+                    if not points:
+                        continue
+                    first = min(points, key=lambda point: int(point[0]))
+                    display_id = display_id_of.get(int(instance_id), int(instance_id))
+                    ax.annotate(
+                        self._format_category_display_id(display_id),
+                        xy=(float(first[3]), float(first[4])),
+                        xytext=(3, 3),
+                        textcoords="offset points",
+                        fontsize=9,
+                        color="black",
+                        bbox={
+                            "boxstyle": "round,pad=0.15",
+                            "facecolor": "white",
+                            "edgecolor": "none",
+                            "alpha": 0.7,
+                        },
+                    )
 
             if not self._set_nm_axes(ax, [pts_for_axes]):
                 plt.close(fig)

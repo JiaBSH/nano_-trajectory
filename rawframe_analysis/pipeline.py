@@ -24,6 +24,8 @@ class TrackerProtocol(Protocol):
 
     def annotate_allcategories_on_rawframe(self, **kwargs: Any) -> Any: ...
 
+    def annotate_boundary_pair_ids_on_rawframe(self, **kwargs: Any) -> Any: ...
+
     def plot_evolution(self, **kwargs: Any) -> Any: ...
 
     def plot_centroid_trajectories(self, **kwargs: Any) -> Any: ...
@@ -35,6 +37,8 @@ class TrackerProtocol(Protocol):
     def plot_area_delta_vs_frame(self, **kwargs: Any) -> Any: ...
 
     def plot_velocity_trajectories(self, **kwargs: Any) -> Any: ...
+
+    def plot_boundary_distances_vs_frame(self, **kwargs: Any) -> Any: ...
 
 
 TrackerFactory = Callable[..., TrackerProtocol]
@@ -90,6 +94,7 @@ class AnalysisPipeline:
         if not (
             self._config.annotations.save_target_raw_frames
             or self._config.annotations.save_all_category_raw_frames
+            or self._config.annotations.save_boundary_pair_id_raw_frames
         ):
             self._log("[skip] Raw-frame visualization disabled.")
 
@@ -115,6 +120,9 @@ class AnalysisPipeline:
             max_particle_pin_distance_nm=cfg.analysis.max_particle_pin_distance_nm,
             fastplot_enabled=cfg.analysis.fastplot_enabled,
             compute_diameter_height_enabled=cfg.analysis.compute_diameter_height_enabled,
+            compute_boundary_distances_enabled=cfg.analysis.compute_boundary_distances_enabled,
+            particle_category=cfg.analysis.particle_category,
+            droplet_category=cfg.analysis.droplet_category,
             output_root=cfg.output.root,
         )
 
@@ -122,6 +130,7 @@ class AnalysisPipeline:
         cfg = self._config
         plots = cfg.plots
         annotations = cfg.annotations
+        tracking_max_dist = cfg.output.export_max_dist_nm
         steps = [PipelineStep("process_all_frames", tracker.process_all_frames)]
 
         if cfg.output.export_csv_results:
@@ -147,6 +156,7 @@ class AnalysisPipeline:
                         raw_frame_dir=cfg.input.raw_frame_dir,
                         output_dir=target_output_dir,
                         label_ids=annotations.target_label_ids,
+                        max_dist=tracking_max_dist,
                         mask_alpha=annotations.mask_alpha,
                         frame_step=annotations.frame_step,
                     ),
@@ -163,6 +173,22 @@ class AnalysisPipeline:
                         mask_alpha=annotations.mask_alpha,
                         show_centroid=annotations.all_category_show_centroid,
                         label_ids=annotations.all_category_label_ids,
+                        max_dist=tracking_max_dist,
+                        frame_step=annotations.frame_step,
+                    ),
+                )
+            )
+
+        if annotations.save_boundary_pair_id_raw_frames:
+            steps.append(
+                PipelineStep(
+                    "annotate_boundary_pair_ids_on_rawframe",
+                    lambda: tracker.annotate_boundary_pair_ids_on_rawframe(
+                        raw_frame_dir=cfg.input.raw_frame_dir,
+                        output_dir=annotations.boundary_pair_output_dir,
+                        mask_alpha=annotations.mask_alpha,
+                        show_centroid=annotations.all_category_show_centroid,
+                        max_dist=tracking_max_dist,
                         frame_step=annotations.frame_step,
                     ),
                 )
@@ -180,7 +206,8 @@ class AnalysisPipeline:
                 PipelineStep(
                     "plot_centroid_trajectories",
                     lambda: tracker.plot_centroid_trajectories(
-                        max_dist=plots.max_dist_nm
+                        max_dist=tracking_max_dist,
+                        annotate_ids_max=plots.annotate_ids_max,
                     ),
                 )
             )
@@ -189,7 +216,7 @@ class AnalysisPipeline:
                 PipelineStep(
                     "plot_area_trajectories",
                     lambda: tracker.plot_area_trajectories(
-                        max_dist=plots.max_dist_nm,
+                        max_dist=tracking_max_dist,
                         min_track_length=plots.min_track_length,
                         debug_stats=plots.debug_stats,
                         max_plot_tracks=plots.max_tracks,
@@ -220,7 +247,7 @@ class AnalysisPipeline:
                 PipelineStep(
                     "plot_velocity_trajectories",
                     lambda: tracker.plot_velocity_trajectories(
-                        max_dist=plots.max_dist_nm,
+                        max_dist=tracking_max_dist,
                         min_track_length=plots.min_track_length,
                         frame_interval_s=plots.frame_interval_s,
                         bin_size_frames=plots.velocity_bin_size_frames,
@@ -228,6 +255,19 @@ class AnalysisPipeline:
                         max_plot_tracks=plots.max_tracks,
                         max_legend_items=plots.max_legend_items,
                         annotate_ids_max=plots.annotate_ids_max,
+                    ),
+                )
+            )
+        if plots.save_boundary_distance_plots:
+            steps.append(
+                PipelineStep(
+                    "plot_boundary_distances_vs_frame",
+                    lambda: tracker.plot_boundary_distances_vs_frame(
+                        max_dist=tracking_max_dist,
+                        min_pair_length=plots.min_track_length,
+                        max_plot_pairs=plots.max_tracks,
+                        max_legend_items=plots.max_legend_items,
+                        debug_stats=plots.debug_stats,
                     ),
                 )
             )
