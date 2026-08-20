@@ -80,8 +80,8 @@ class FrameProcessingMixin:
         if self.instance_overlap_postprocess_enabled:
             print(
                 "[postprocess] suppressed "
-                f"{self.same_category_suppressed_count} same-category duplicate masks and "
-                f"{self.cross_category_suppressed_count} particle-in-droplet conflicts."
+                f"{self.same_category_suppressed_count} additional same-category masks "
+                "by merging their unions; cross-category overlaps were preserved."
             )
 
     def _category_polygons(self, data, category, shift):

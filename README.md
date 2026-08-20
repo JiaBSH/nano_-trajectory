@@ -52,16 +52,19 @@ produce a distance of zero:
 The category names are configurable through `analysis.particle_category` and
 `analysis.droplet_category`; output filenames follow those values.
 
-Frame-local instance cleanup runs before every measurement, tracking pass, CSV
+Frame-local instance merging runs before every measurement, tracking pass, CSV
 export, distance calculation, and annotation.  It is enabled with
 `analysis.instance_overlap_postprocess_enabled`.  For the configured particle
-and droplet categories it performs two checks:
+and droplet categories it applies this rule independently to each category:
 
 - `same_category_containment_threshold` (default `0.85`): when one same-category
-  mask is almost contained in a larger mask, keep only the larger instance.
-- `particle_in_droplet_threshold` (default `0.50`): when at least half of a
-  particle mask lies inside a droplet mask, keep the droplet and suppress the
-  conflicting particle prediction.
+  mask overlaps at least this fraction of the smaller mask, replace the two
+  predictions with their union as one instance.
+
+Different categories are never removed because of spatial overlap.  In
+particular, a nanocluster and a nanodroplet may occupy the same location and both
+are retained.  The legacy `particle_in_droplet_threshold` option is accepted in
+older saved run configs for compatibility but no longer suppresses anything.
 
 The source JSON files are never modified.  The cleaned frame objects are cached
 once and reused by all downstream tables and renderers, so a suppressed mask

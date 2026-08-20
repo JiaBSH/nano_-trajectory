@@ -165,6 +165,19 @@ class ConfigTests(unittest.TestCase):
         self.assertIsNone(config.annotations.target_output_dir)
         self.assertFalse(config.annotations.target_label_ids)
 
+    def test_legacy_cross_category_threshold_is_ignored(self):
+        config = RawFrameConfig.from_dict(
+            {
+                "config_version": 2,
+                "input": {"json_dir": "annotations"},
+                "analysis": {"particle_in_droplet_threshold": 0.5},
+            }
+        )
+
+        self.assertNotIn(
+            "particle_in_droplet_threshold", config.to_dict()["analysis"]
+        )
+
 
 class FakeTracker:
     def __init__(self, **kwargs):

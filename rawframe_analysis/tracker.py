@@ -61,7 +61,6 @@ class GasTracker(
         droplet_category="nanodroplet",
         instance_overlap_postprocess_enabled=True,
         same_category_containment_threshold=0.85,
-        particle_in_droplet_threshold=0.50,
     ):
         target_category = self._resolve_legacy_category(
             target_category=target_category,
@@ -87,7 +86,6 @@ class GasTracker(
             droplet_category=droplet_category,
             instance_overlap_postprocess_enabled=instance_overlap_postprocess_enabled,
             same_category_containment_threshold=same_category_containment_threshold,
-            particle_in_droplet_threshold=particle_in_droplet_threshold,
         )
         self._initialize_run_state()
         self._prepare_output_directory(output_root)
@@ -120,7 +118,6 @@ class GasTracker(
         droplet_category,
         instance_overlap_postprocess_enabled,
         same_category_containment_threshold,
-        particle_in_droplet_threshold,
     ):
         """Normalize constructor arguments into stable tracker options."""
         self.json_dir = json_dir
@@ -157,9 +154,6 @@ class GasTracker(
         self.same_category_containment_threshold = self._unit_interval_float(
             "same_category_containment_threshold",
             same_category_containment_threshold,
-        )
-        self.particle_in_droplet_threshold = self._unit_interval_float(
-            "particle_in_droplet_threshold", particle_in_droplet_threshold
         )
 
     @staticmethod

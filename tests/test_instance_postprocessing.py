@@ -11,7 +11,7 @@ from rawframe_analysis.tracking import ObjectTrackingMixin
 
 
 class InstancePostprocessingTests(unittest.TestCase):
-    def test_nested_duplicates_and_particle_in_droplet_are_suppressed(self):
+    def test_nested_same_category_masks_merge_but_cross_category_overlap_remains(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             json_dir = base / "annotations"
@@ -48,18 +48,46 @@ class InstancePostprocessingTests(unittest.TestCase):
                 )
                 tracker.process_all_frames()
 
-            self.assertEqual(len(tracker.object_records), 1)
-            self.assertEqual(len(tracker.boundary_particle_records), 1)
+            self.assertEqual(len(tracker.object_records), 2)
+            self.assertEqual(len(tracker.boundary_particle_records), 2)
             self.assertEqual(len(tracker.boundary_droplet_records), 1)
             self.assertEqual(tracker.same_category_suppressed_count, 1)
-            self.assertEqual(tracker.cross_category_suppressed_count, 1)
+            self.assertEqual(tracker.cross_category_suppressed_count, 0)
             self.assertEqual(
                 {record["reason"] for record in tracker.instance_postprocess_records},
-                {
-                    "same_category_containment",
-                    "particle_contained_in_droplet",
-                },
+                {"same_category_overlap_merge"},
             )
+
+    def test_partial_same_category_overlap_uses_union_shape(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            json_dir = base / "annotations"
+            json_dir.mkdir()
+            objects = [
+                {
+                    "category": "nanocluster",
+                    "segmentation": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                },
+                {
+                    "category": "nanocluster",
+                    "segmentation": [[1, 0], [11, 0], [11, 10], [1, 10]],
+                },
+            ]
+            (json_dir / "frame_0001.json").write_text(
+                json.dumps({"objects": objects}), encoding="utf-8"
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                tracker = GasTracker(
+                    json_dir=str(json_dir),
+                    nm_per_px=1.0,
+                    target_category="nanocluster",
+                    output_root=str(base / "output"),
+                )
+                tracker.process_all_frames()
+
+            self.assertEqual(len(tracker.object_records), 1)
+            self.assertGreater(tracker.object_records[0][5], 100.0)
 
     def test_low_overlap_instances_remain_separate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -92,7 +120,7 @@ class InstancePostprocessingTests(unittest.TestCase):
             self.assertEqual(len(tracker.object_records), 2)
             self.assertEqual(tracker.same_category_suppressed_count, 0)
 
-    def test_minor_particle_droplet_contact_remains_separate(self):
+    def test_fully_overlapping_particle_and_droplet_remain_separate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             json_dir = base / "annotations"
@@ -104,7 +132,7 @@ class InstancePostprocessingTests(unittest.TestCase):
                 },
                 {
                     "category": "nanodroplet",
-                    "segmentation": [[8, 0], [18, 0], [18, 10], [8, 10]],
+                    "segmentation": [[0, 0], [10, 0], [10, 10], [0, 10]],
                 },
             ]
             (json_dir / "frame_0001.json").write_text(

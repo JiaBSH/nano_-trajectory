@@ -43,7 +43,6 @@ class AnalysisConfig:
     compute_boundary_distances_enabled: bool = False
     instance_overlap_postprocess_enabled: bool = True
     same_category_containment_threshold: float = 0.85
-    particle_in_droplet_threshold: float = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,6 +123,12 @@ def _migrate_config(raw: Mapping[str, Any]) -> dict[str, Any]:
     migrated = deepcopy(dict(raw))
     version = migrated.get("config_version", 1)
     if version == _CURRENT_CONFIG_VERSION:
+        analysis = migrated.get("analysis")
+        if isinstance(analysis, dict):
+            # Version-2 snapshots written by the short-lived cross-category
+            # suppression implementation remain loadable, but the option is
+            # intentionally discarded because different categories may overlap.
+            analysis.pop("particle_in_droplet_threshold", None)
         return migrated
     if version != 1:
         raise ConfigError(
@@ -364,10 +369,7 @@ class RawFrameConfig:
             raise ConfigError(
                 "'analysis.pin_centroid_smoothing_alpha' must be at most 1"
             )
-        for name in (
-            "same_category_containment_threshold",
-            "particle_in_droplet_threshold",
-        ):
+        for name in ("same_category_containment_threshold",):
             value = getattr(self.analysis, name)
             _require_number(f"analysis.{name}", value, strictly_positive=True)
             if float(value) > 1.0:

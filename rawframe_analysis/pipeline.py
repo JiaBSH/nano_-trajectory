@@ -128,7 +128,6 @@ class AnalysisPipeline:
             droplet_category=cfg.analysis.droplet_category,
             instance_overlap_postprocess_enabled=cfg.analysis.instance_overlap_postprocess_enabled,
             same_category_containment_threshold=cfg.analysis.same_category_containment_threshold,
-            particle_in_droplet_threshold=cfg.analysis.particle_in_droplet_threshold,
             output_root=cfg.output.root,
         )
 
