@@ -262,12 +262,14 @@ class ObjectTrackingMixin:
     def _build_event_id_series(
         self, detections_by_frame, max_dist=50.0, return_assignments=False
     ):
-        """Assign globally-incrementing ids with continuity-first linking.
+        """Assign globally-incrementing IDs with merge/split lifecycle semantics.
 
         Rules:
         - First frame detections get ids 1..N
         - Consecutive frames are linked by nearest-neighbor (one-to-one) within max_dist
-        - Matched detections keep previous ids, even if object counts change
+        - Unambiguous one-to-one matches keep their previous IDs
+        - A many-to-one merge receives one new ID
+        - Every child of a one-to-many split receives a new ID
         - Unmatched current detections get NEW ids
 
                 detections_by_frame: dict[int, list[tuple[frame_name,nm_per_px,cx_nm,cy_nm,area_nm2]]]
@@ -321,7 +323,9 @@ class ObjectTrackingMixin:
                 prev_dets, prev_ids = curr_dets, []
                 continue
 
-            # Do one-to-one assignment by minimal distance for all count combinations.
+            # Candidate distances are also used to identify local many-to-one
+            # and one-to-many topology changes.  Frame-local duplicate masks
+            # have already been removed before detections reach this method.
             prev_xy = np.array([[d[2], d[3]] for d in prev_dets], dtype=np.float64)
             curr_xy = np.array([[d[2], d[3]] for d in curr_dets], dtype=np.float64)
             dists = np.linalg.norm(prev_xy[:, None, :] - curr_xy[None, :, :], axis=2)
@@ -334,8 +338,57 @@ class ObjectTrackingMixin:
                         pairs.append((dist, i, j))
             pairs.sort(key=lambda x: x[0])
 
-            used_prev = set()
-            used_curr = set()
+            nearest_curr_by_prev = {}
+            for i in range(n_prev):
+                candidates = [
+                    (float(dists[i, j]), j)
+                    for j in range(n_curr)
+                    if float(dists[i, j]) <= float(max_dist)
+                ]
+                if candidates:
+                    nearest_curr_by_prev[i] = min(candidates)[1]
+
+            nearest_prev_by_curr = {}
+            for j in range(n_curr):
+                candidates = [
+                    (float(dists[i, j]), i)
+                    for i in range(n_prev)
+                    if float(dists[i, j]) <= float(max_dist)
+                ]
+                if candidates:
+                    nearest_prev_by_curr[j] = min(candidates)[1]
+
+            merge_sources_by_curr = {}
+            if n_prev > n_curr:
+                for i, j in nearest_curr_by_prev.items():
+                    merge_sources_by_curr.setdefault(j, []).append(i)
+                merge_sources_by_curr = {
+                    j: indices
+                    for j, indices in merge_sources_by_curr.items()
+                    if len(indices) >= 2
+                }
+
+            split_children_by_prev = {}
+            if n_curr > n_prev:
+                for j, i in nearest_prev_by_curr.items():
+                    split_children_by_prev.setdefault(i, []).append(j)
+                split_children_by_prev = {
+                    i: indices
+                    for i, indices in split_children_by_prev.items()
+                    if len(indices) >= 2
+                }
+
+            forced_new_curr = set(merge_sources_by_curr)
+            forced_new_curr.update(
+                j for indices in split_children_by_prev.values() for j in indices
+            )
+            event_prev = {
+                i for indices in merge_sources_by_curr.values() for i in indices
+            }
+            event_prev.update(split_children_by_prev)
+
+            used_prev = set(event_prev)
+            used_curr = set(forced_new_curr)
             for _dist, i, j in pairs:
                 if i in used_prev or j in used_curr:
                     continue
@@ -343,14 +396,38 @@ class ObjectTrackingMixin:
                 used_prev.add(i)
                 used_curr.add(j)
 
-            # any unmatched current object becomes a new id
+            # Event objects and ordinary unmatched births receive new IDs.
             for j in range(n_curr):
                 if curr_ids[j] is None:
                     curr_ids[j] = int(next_id)
-                    events.append(
-                        {"frame": frame, "type": "birth", "dst_id": int(next_id)}
-                    )
+                    if j not in forced_new_curr:
+                        events.append(
+                            {
+                                "frame": frame,
+                                "type": "birth",
+                                "dst_id": int(next_id),
+                            }
+                        )
                     next_id += 1
+
+            for j, source_indices in sorted(merge_sources_by_curr.items()):
+                events.append(
+                    {
+                        "frame": frame,
+                        "type": "merge",
+                        "src_ids": [int(prev_ids[i]) for i in source_indices],
+                        "dst_id": int(curr_ids[j]),
+                    }
+                )
+            for i, child_indices in sorted(split_children_by_prev.items()):
+                events.append(
+                    {
+                        "frame": frame,
+                        "type": "split",
+                        "src_id": int(prev_ids[i]),
+                        "dst_ids": [int(curr_ids[j]) for j in child_indices],
+                    }
+                )
 
             assigned_ids_by_frame[frame] = curr_ids
             prev_dets, prev_ids = curr_dets, curr_ids

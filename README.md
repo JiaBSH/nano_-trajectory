@@ -52,6 +52,21 @@ produce a distance of zero:
 The category names are configurable through `analysis.particle_category` and
 `analysis.droplet_category`; output filenames follow those values.
 
+Frame-local instance cleanup runs before every measurement, tracking pass, CSV
+export, distance calculation, and annotation.  It is enabled with
+`analysis.instance_overlap_postprocess_enabled`.  For the configured particle
+and droplet categories it performs two checks:
+
+- `same_category_containment_threshold` (default `0.85`): when one same-category
+  mask is almost contained in a larger mask, keep only the larger instance.
+- `particle_in_droplet_threshold` (default `0.50`): when at least half of a
+  particle mask lies inside a droplet mask, keep the droplet and suppress the
+  conflicting particle prediction.
+
+The source JSON files are never modified.  The cleaned frame objects are cached
+once and reused by all downstream tables and renderers, so a suppressed mask
+cannot remain in an annotation while disappearing from a CSV (or vice versa).
+
 Set `plots.save_boundary_distance_plots` to `true` to also generate:
 
 - `nanocluster_to_nanocluster_boundary_distance_vs_frame.png`
@@ -70,6 +85,11 @@ used as a direct join/search key without adding or removing a prefix.
 One-frame tracks have no computable speed and are omitted from the speed output,
 but the remaining IDs are never renumbered.
 
+Merge/split events use lifecycle IDs.  An unambiguous one-to-one match keeps its
+ID, but a many-to-one merge receives a new ID and every child of a one-to-many
+split receives a new ID.  Therefore a two-object merge followed by a split uses
+exactly five IDs: two before merging, one while merged, and two after splitting.
+
 When `annotations.save_boundary_pair_id_raw_frames` is `true`, a second raw-frame
 overlay set is written to `annotated_boundary_pair_ids_rawframe`. It preserves the
 normal all-category masks and outlines but labels particles as `P1`, `P2`, ... and
@@ -82,7 +102,8 @@ The code is separated by responsibility:
 - `rawframe_analysis/config.py`: typed configuration, validation, and snapshots.
 - `rawframe_analysis/pipeline.py`: configurable run orchestration.
 - `rawframe_analysis/tracker.py`: lightweight state initialization and capability composition.
-- `rawframe_analysis/inputs.py`, `geometry.py`, `processing.py`, `tracking.py`:
+- `rawframe_analysis/inputs.py`, `geometry.py`, `postprocessing.py`,
+  `processing.py`, `tracking.py`:
   focused analysis stages.
 - `rawframe_analysis/exporting.py`: CSV serialization.
 - annotation and plotting modules: one renderer or plot family per file.

@@ -41,6 +41,9 @@ class AnalysisConfig:
     fastplot_enabled: bool = True
     compute_diameter_height_enabled: bool = False
     compute_boundary_distances_enabled: bool = False
+    instance_overlap_postprocess_enabled: bool = True
+    same_category_containment_threshold: float = 0.85
+    particle_in_droplet_threshold: float = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,6 +352,7 @@ class RawFrameConfig:
             "fastplot_enabled",
             "compute_diameter_height_enabled",
             "compute_boundary_distances_enabled",
+            "instance_overlap_postprocess_enabled",
         ):
             _require_bool(f"analysis.{name}", getattr(self.analysis, name))
         _require_number(
@@ -360,6 +364,14 @@ class RawFrameConfig:
             raise ConfigError(
                 "'analysis.pin_centroid_smoothing_alpha' must be at most 1"
             )
+        for name in (
+            "same_category_containment_threshold",
+            "particle_in_droplet_threshold",
+        ):
+            value = getattr(self.analysis, name)
+            _require_number(f"analysis.{name}", value, strictly_positive=True)
+            if float(value) > 1.0:
+                raise ConfigError(f"'analysis.{name}' must be at most 1")
         if self.analysis.max_particle_pin_distance_nm is not None:
             _require_number(
                 "analysis.max_particle_pin_distance_nm",

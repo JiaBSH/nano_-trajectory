@@ -157,6 +157,9 @@ class AllCategoryAnnotationMixin:
                     jdata_pre = json.load(f)
             except Exception:
                 continue
+            jdata_pre = self._postprocess_frame_instances(
+                jdata_pre, frame_name=frame_name
+            )
             try:
                 nm_pre = self._nm_per_px_for_frame(frame_name)
             except Exception:
@@ -241,6 +244,9 @@ class AllCategoryAnnotationMixin:
                     json_path = os.path.join(self.json_dir, json_name)
                     with open(json_path, "r", encoding="utf-8") as f:
                         jdata = json.load(f)
+                    jdata = self._postprocess_frame_instances(
+                        jdata, frame_name=frame_name
+                    )
 
                     try:
                         nm_per_px = self._nm_per_px_for_frame(frame_name)

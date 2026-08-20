@@ -19,6 +19,7 @@ class FrameProcessingMixin:
                 data = json.load(f)
 
             frame_name = Path(json_name).stem
+            data = self._postprocess_frame_instances(data, frame_name=frame_name)
             try:
                 nm_per_px = self._nm_per_px_for_frame(frame_name)
             except Exception as e:
@@ -76,6 +77,12 @@ class FrameProcessingMixin:
                     f"[pin] filtered {self.filtered_far_particle_count} {self.target_category} objects farther than "
                     f"{self.max_particle_pin_distance_nm:.6f} nm from pin centroid."
                 )
+        if self.instance_overlap_postprocess_enabled:
+            print(
+                "[postprocess] suppressed "
+                f"{self.same_category_suppressed_count} same-category duplicate masks and "
+                f"{self.cross_category_suppressed_count} particle-in-droplet conflicts."
+            )
 
     def _category_polygons(self, data, category, shift):
         """Return valid category polygons with frame-local and JSON indices."""
@@ -98,7 +105,9 @@ class FrameProcessingMixin:
             polygons.append(
                 {
                     "frame_index": len(polygons) + 1,
-                    "json_object_index": int(json_object_index),
+                    "json_object_index": int(
+                        obj.get("_raw_json_object_index", json_object_index)
+                    ),
                     "points": points[:, :2],
                     "tracking_centroid_px": centroid,
                     "area_px2": float(area_px2),

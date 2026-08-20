@@ -14,6 +14,7 @@ from .exporting import CsvExportMixin
 from .geometry import GeometryMixin
 from .inputs import InputMixin
 from .plot_style import PlotStyleMixin
+from .postprocessing import InstancePostprocessingMixin
 from .processing import FrameProcessingMixin
 from .summary_plots import SummaryPlotMixin
 from .tracking import ObjectTrackingMixin
@@ -23,6 +24,7 @@ from .trajectory_plots import TrajectoryPlotMixin
 class GasTracker(
     InputMixin,
     GeometryMixin,
+    InstancePostprocessingMixin,
     FrameProcessingMixin,
     ObjectTrackingMixin,
     CsvExportMixin,
@@ -57,6 +59,9 @@ class GasTracker(
         compute_boundary_distances_enabled=False,
         particle_category="nanocluster",
         droplet_category="nanodroplet",
+        instance_overlap_postprocess_enabled=True,
+        same_category_containment_threshold=0.85,
+        particle_in_droplet_threshold=0.50,
     ):
         target_category = self._resolve_legacy_category(
             target_category=target_category,
@@ -80,6 +85,9 @@ class GasTracker(
             compute_boundary_distances_enabled=compute_boundary_distances_enabled,
             particle_category=particle_category,
             droplet_category=droplet_category,
+            instance_overlap_postprocess_enabled=instance_overlap_postprocess_enabled,
+            same_category_containment_threshold=same_category_containment_threshold,
+            particle_in_droplet_threshold=particle_in_droplet_threshold,
         )
         self._initialize_run_state()
         self._prepare_output_directory(output_root)
@@ -110,6 +118,9 @@ class GasTracker(
         compute_boundary_distances_enabled,
         particle_category,
         droplet_category,
+        instance_overlap_postprocess_enabled,
+        same_category_containment_threshold,
+        particle_in_droplet_threshold,
     ):
         """Normalize constructor arguments into stable tracker options."""
         self.json_dir = json_dir
@@ -140,6 +151,16 @@ class GasTracker(
             raise ValueError("particle_category and droplet_category must be non-empty")
         if self.particle_category == self.droplet_category:
             raise ValueError("particle_category and droplet_category must be different")
+        self.instance_overlap_postprocess_enabled = bool(
+            instance_overlap_postprocess_enabled
+        )
+        self.same_category_containment_threshold = self._unit_interval_float(
+            "same_category_containment_threshold",
+            same_category_containment_threshold,
+        )
+        self.particle_in_droplet_threshold = self._unit_interval_float(
+            "particle_in_droplet_threshold", particle_in_droplet_threshold
+        )
 
     @staticmethod
     def _resolve_legacy_category(*, target_category, gas_category):
@@ -188,6 +209,10 @@ class GasTracker(
         self._object_detections_by_frame_cache_records = None
         self._object_detections_by_frame_cache_record_count = 0
         self._event_id_series_cache = {}
+        self._postprocessed_frame_cache = {}
+        self.instance_postprocess_records = []
+        self.same_category_suppressed_count = 0
+        self.cross_category_suppressed_count = 0
 
     def _prepare_output_directory(self, output_root):
         if output_root is None:
