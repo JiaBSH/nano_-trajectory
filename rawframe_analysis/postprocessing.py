@@ -1,4 +1,4 @@
-"""Frame-local cleanup for overlapping instance-segmentation masks."""
+"""Frame-local and temporal cleanup for instance-segmentation masks."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ except ImportError:  # pragma: no cover - exercised only in incomplete environme
 
 
 class InstancePostprocessingMixin:
-    """Merge strongly overlapping masks that have the same category.
+    """Merge strongly overlapping or substantially contacting same-class masks.
 
     Model predictions can contain a smaller mask almost completely inside a
     second mask for the same physical object.  Tracking such raw predictions
     creates false births and many short-lived IDs.  This mixin performs
-    frame-local mask merging before any measurement, tracking, export, or
+    mask merging before any measurement, tracking, export, or
     drawing.  Different categories are deliberately independent: a particle
     and a droplet may occupy the same location and both remain valid.
     """
@@ -58,12 +58,23 @@ class InstancePostprocessingMixin:
 
         masks, mask_left, mask_top = self._rasterize_instance_masks(valid_points)
         kept = set(range(len(objects)))
-        threshold = float(self.same_category_containment_threshold)
+        overlap_threshold = float(self.same_category_containment_threshold)
+        contact_gap_px = int(self.same_category_contact_gap_px)
+        contact_threshold = float(self.same_category_contact_threshold)
+        temporal_gap_px = int(self.same_category_temporal_gap_px)
+        temporal_contact_threshold = float(
+            self.same_category_temporal_contact_threshold
+        )
+        temporal_coverage_threshold = float(
+            self.same_category_temporal_coverage_threshold
+        )
 
-        # Same-category union: connect masks when their intersection covers at
-        # least ``threshold`` of the smaller mask.  Connected groups are
-        # replaced by their raster union, so protruding pixels from every
-        # prediction remain part of the merged instance.
+        # Same-category union uses three complementary criteria:
+        # 1. sufficient intersection relative to the smaller mask;
+        # 2. a sufficiently long near-contact boundary within a small pixel gap.
+        # 3. wider near-contact when both fragments belong to one prior mask.
+        # The latter criteria handle one physical instance predicted as upper
+        # and lower fragments whose masks have little or no intersection.
         for category in selected_categories:
             indices = [
                 index
@@ -85,12 +96,45 @@ class InstancePostprocessingMixin:
                 if first_root != second_root:
                     parent[second_root] = first_root
 
-            overlap_by_pair = {}
+            temporal_relations = self._temporal_same_category_relations(
+                valid_points=valid_points,
+                indices=indices,
+                category=category,
+                current_masks=masks,
+                gap_px=temporal_gap_px,
+                contact_threshold=temporal_contact_threshold,
+                coverage_threshold=temporal_coverage_threshold,
+            )
+            merge_relation_by_pair = {}
             for position, first in enumerate(indices):
                 for second in indices[position + 1 :]:
                     overlap = self._mask_containment(masks[first], masks[second])
-                    overlap_by_pair[(first, second)] = overlap
-                    if overlap >= threshold:
+                    if overlap >= overlap_threshold:
+                        merge_relation_by_pair[(first, second)] = (
+                            "same_category_overlap_merge",
+                            overlap,
+                            0,
+                        )
+                        union(first, second)
+                        continue
+                    contact = self._mask_contact_fraction(
+                        masks[first], masks[second], gap_px=contact_gap_px
+                    )
+                    if contact >= contact_threshold:
+                        merge_relation_by_pair[(first, second)] = (
+                            "same_category_contact_merge",
+                            contact,
+                            contact_gap_px,
+                        )
+                        union(first, second)
+                        continue
+                    temporal_relation = temporal_relations.get((first, second))
+                    if temporal_relation is not None:
+                        merge_relation_by_pair[(first, second)] = (
+                            "same_category_temporal_contact_merge",
+                            temporal_relation,
+                            temporal_gap_px,
+                        )
                         union(first, second)
 
             groups = {}
@@ -104,6 +148,25 @@ class InstancePostprocessingMixin:
                 union_mask = np.logical_or.reduce(
                     [masks[index][0] for index in members]
                 )
+                member_set = set(members)
+                bridge_gap_px = max(
+                    (
+                        relation_gap_px
+                        for (first, second), (
+                            _reason,
+                            _score,
+                            relation_gap_px,
+                        ) in merge_relation_by_pair.items()
+                        if relation_gap_px > 0
+                        and first in member_set
+                        and second in member_set
+                    ),
+                    default=0,
+                )
+                if bridge_gap_px > 0:
+                    union_mask = self._bridge_nearby_masks(
+                        union_mask, gap_px=bridge_gap_px
+                    )
                 merged_segmentation = self._mask_union_polygon(
                     union_mask, mask_left, mask_top
                 )
@@ -117,10 +180,20 @@ class InstancePostprocessingMixin:
                     if index == retained_index:
                         continue
                     kept.discard(index)
-                    pair = tuple(sorted((retained_index, index)))
-                    overlap = overlap_by_pair.get(pair)
-                    if overlap is None:
-                        overlap = max(
+                    relations = [
+                        relation
+                        for pair, relation in merge_relation_by_pair.items()
+                        if index in pair
+                        and pair[0] in member_set
+                        and pair[1] in member_set
+                    ]
+                    if relations:
+                        reason, merge_score, _gap_px = max(
+                            relations, key=lambda item: item[1]
+                        )
+                    else:
+                        reason = "same_category_overlap_merge"
+                        merge_score = max(
                             self._mask_containment(masks[index], masks[other])
                             for other in members
                             if other != index
@@ -129,16 +202,78 @@ class InstancePostprocessingMixin:
                         frame_name=frame_name,
                         removed=objects[index],
                         retained=objects[retained_index],
-                        reason="same_category_overlap_merge",
-                        overlap_fraction=overlap,
+                        reason=reason,
+                        overlap_fraction=merge_score,
                     )
                     self.same_category_suppressed_count += 1
 
         cleaned = dict(data)
-        cleaned["objects"] = [obj for index, obj in enumerate(objects) if index in kept]
+        cleaned["objects"] = [
+            obj for index, obj in enumerate(objects) if index in kept
+        ]
+        self._previous_postprocessed_objects = list(cleaned["objects"])
         if cache_key is not None:
             self._postprocessed_frame_cache[cache_key] = cleaned
         return cleaned
+
+    def _temporal_same_category_relations(
+        self,
+        *,
+        valid_points,
+        indices,
+        category,
+        current_masks,
+        gap_px,
+        contact_threshold,
+        coverage_threshold,
+    ):
+        """Find nearby current fragments covered by one prior same-class mask."""
+        previous_objects = self._previous_postprocessed_objects or []
+        previous_points = {}
+        for previous_index, obj in enumerate(previous_objects):
+            if str(obj.get("category", "")).strip().lower() != category:
+                continue
+            points = np.asarray(obj.get("segmentation", []), dtype=np.float64)
+            if (
+                points.ndim == 2
+                and points.shape[0] >= 3
+                and points.shape[1] >= 2
+                and np.all(np.isfinite(points[:, :2]))
+            ):
+                previous_points[("previous", previous_index)] = points[:, :2]
+        if not previous_points or len(indices) < 2:
+            return {}
+
+        joint_points = dict(previous_points)
+        joint_points.update(
+            {
+                ("current", index): valid_points[index]
+                for index in indices
+                if index in valid_points
+            }
+        )
+        joint_masks, _left, _top = self._rasterize_instance_masks(joint_points)
+        relations = {}
+        for position, first in enumerate(indices):
+            for second in indices[position + 1 :]:
+                contact = self._mask_contact_fraction(
+                    current_masks[first], current_masks[second], gap_px=gap_px
+                )
+                if contact < contact_threshold:
+                    continue
+                first_key = ("current", first)
+                second_key = ("current", second)
+                shares_previous = any(
+                    self._mask_coverage(joint_masks[first_key], previous_mask)
+                    >= coverage_threshold
+                    and self._mask_coverage(joint_masks[second_key], previous_mask)
+                    >= coverage_threshold
+                    for previous_key, previous_mask in joint_masks.items()
+                    if previous_key[0] == "previous"
+                )
+                if shares_previous:
+                    relations[(first, second)] = contact
+        return relations
 
     @staticmethod
     def _rasterize_instance_masks(valid_points):
@@ -177,7 +312,13 @@ class InstancePostprocessingMixin:
         )
         if not contours:
             return None
-        contour = max(contours, key=cv2.contourArea)
+        if len(contours) == 1:
+            contour = contours[0]
+        else:
+            # Contact-merged masks should normally be connected by closing.
+            # The hull is a safe fallback for a subpixel raster gap that leaves
+            # multiple exterior contours after closing.
+            contour = cv2.convexHull(np.vstack(contours))
         points = contour[:, 0, :].astype(np.float64)
         if points.shape[0] < 3:
             return None
@@ -194,6 +335,58 @@ class InstancePostprocessingMixin:
             return 0.0
         intersection = int(np.count_nonzero(first_mask & second_mask))
         return float(intersection) / float(smaller_area)
+
+    @staticmethod
+    def _mask_coverage(subject, reference):
+        subject_mask, subject_area = subject
+        if int(subject_area) <= 0:
+            return 0.0
+        intersection = int(np.count_nonzero(subject_mask & reference[0]))
+        return float(intersection) / float(subject_area)
+
+    @staticmethod
+    def _mask_contact_fraction(first, second, gap_px):
+        if cv2 is None:
+            raise RuntimeError(
+                "OpenCV is required to measure same-category mask contact"
+            )
+        first_mask = np.asarray(first[0], dtype=np.uint8)
+        second_mask = np.asarray(second[0], dtype=np.uint8)
+        edge_kernel = np.ones((3, 3), dtype=np.uint8)
+        first_boundary = first_mask - cv2.erode(first_mask, edge_kernel)
+        second_boundary = second_mask - cv2.erode(second_mask, edge_kernel)
+        first_perimeter = int(np.count_nonzero(first_boundary))
+        second_perimeter = int(np.count_nonzero(second_boundary))
+        shorter_perimeter = min(first_perimeter, second_perimeter)
+        if shorter_perimeter <= 0:
+            return 0.0
+
+        diameter = 2 * int(gap_px) + 1
+        gap_kernel = np.ones((diameter, diameter), dtype=np.uint8)
+        first_contact = int(
+            np.count_nonzero(
+                first_boundary & cv2.dilate(second_boundary, gap_kernel)
+            )
+        )
+        second_contact = int(
+            np.count_nonzero(
+                second_boundary & cv2.dilate(first_boundary, gap_kernel)
+            )
+        )
+        if first_perimeter <= second_perimeter:
+            return float(first_contact) / float(first_perimeter)
+        return float(second_contact) / float(second_perimeter)
+
+    @staticmethod
+    def _bridge_nearby_masks(mask, gap_px):
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required to bridge nearby instance masks")
+        diameter = 2 * int(gap_px) + 1
+        kernel = np.ones((diameter, diameter), dtype=np.uint8)
+        bridged = cv2.morphologyEx(
+            np.asarray(mask, dtype=np.uint8), cv2.MORPH_CLOSE, kernel
+        )
+        return bridged.astype(bool)
 
     def _record_suppressed_instance(
         self, *, frame_name, removed, retained, reason, overlap_fraction

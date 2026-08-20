@@ -96,6 +96,7 @@ class BoundaryDistanceExportTests(unittest.TestCase):
                     target_category="nanocluster",
                     compute_diameter_height_enabled=False,
                     compute_boundary_distances_enabled=True,
+                    instance_overlap_postprocess_enabled=False,
                     output_root=str(output_dir),
                 )
                 tracker.process_all_frames()

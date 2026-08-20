@@ -22,7 +22,12 @@
     "compute_diameter_height_enabled": false,
     "compute_boundary_distances_enabled": true,
     "instance_overlap_postprocess_enabled": true,
-    "same_category_containment_threshold": 0.85
+    "same_category_containment_threshold": 0.3,
+    "same_category_contact_gap_px": 5,
+    "same_category_contact_threshold": 0.1,
+    "same_category_temporal_gap_px": 20,
+    "same_category_temporal_contact_threshold": 0.1,
+    "same_category_temporal_coverage_threshold": 0.5
   },
   "output": {
     "root": "gas_pin_relative_0819",

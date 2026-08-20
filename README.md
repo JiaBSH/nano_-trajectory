@@ -52,14 +52,26 @@ produce a distance of zero:
 The category names are configurable through `analysis.particle_category` and
 `analysis.droplet_category`; output filenames follow those values.
 
-Frame-local instance merging runs before every measurement, tracking pass, CSV
+Instance merging runs before every measurement, tracking pass, CSV
 export, distance calculation, and annotation.  It is enabled with
 `analysis.instance_overlap_postprocess_enabled`.  For the configured particle
-and droplet categories it applies this rule independently to each category:
+and droplet categories it applies three complementary rules independently to each
+category:
 
-- `same_category_containment_threshold` (default `0.85`): when one same-category
+- `same_category_containment_threshold` (default `0.30`): when one same-category
   mask overlaps at least this fraction of the smaller mask, replace the two
   predictions with their union as one instance.
+- `same_category_contact_gap_px` (default `5`) and
+  `same_category_contact_threshold` (default `0.10`): masks whose boundaries are
+  within the configured pixel gap are also merged when their near-contact length
+  reaches the configured fraction of the shorter perimeter.  This handles one
+  large instance incorrectly predicted as upper and lower fragments.
+- `same_category_temporal_gap_px` (default `20`),
+  `same_category_temporal_contact_threshold` (default `0.10`), and
+  `same_category_temporal_coverage_threshold` (default `0.50`): a wider gap is
+  accepted only when both current fragments are covered by the same same-category
+  instance in the preceding frame.  This repairs transient split predictions
+  without merging separate nearby droplets that persist across frames.
 
 Different categories are never removed because of spatial overlap.  In
 particular, a nanocluster and a nanodroplet may occupy the same location and both

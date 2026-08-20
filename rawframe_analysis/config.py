@@ -42,7 +42,12 @@ class AnalysisConfig:
     compute_diameter_height_enabled: bool = False
     compute_boundary_distances_enabled: bool = False
     instance_overlap_postprocess_enabled: bool = True
-    same_category_containment_threshold: float = 0.85
+    same_category_containment_threshold: float = 0.30
+    same_category_contact_gap_px: int = 5
+    same_category_contact_threshold: float = 0.10
+    same_category_temporal_gap_px: int = 20
+    same_category_temporal_contact_threshold: float = 0.10
+    same_category_temporal_coverage_threshold: float = 0.50
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,11 +374,24 @@ class RawFrameConfig:
             raise ConfigError(
                 "'analysis.pin_centroid_smoothing_alpha' must be at most 1"
             )
-        for name in ("same_category_containment_threshold",):
+        for name in (
+            "same_category_containment_threshold",
+            "same_category_contact_threshold",
+            "same_category_temporal_contact_threshold",
+            "same_category_temporal_coverage_threshold",
+        ):
             value = getattr(self.analysis, name)
             _require_number(f"analysis.{name}", value, strictly_positive=True)
             if float(value) > 1.0:
                 raise ConfigError(f"'analysis.{name}' must be at most 1")
+        for name in (
+            "same_category_contact_gap_px",
+            "same_category_temporal_gap_px",
+        ):
+            value = getattr(self.analysis, name)
+            _require_number(f"analysis.{name}", value, minimum=1)
+            if not isinstance(value, int):
+                raise ConfigError(f"'analysis.{name}' must be an integer")
         if self.analysis.max_particle_pin_distance_nm is not None:
             _require_number(
                 "analysis.max_particle_pin_distance_nm",

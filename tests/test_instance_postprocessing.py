@@ -89,7 +89,7 @@ class InstancePostprocessingTests(unittest.TestCase):
             self.assertEqual(len(tracker.object_records), 1)
             self.assertGreater(tracker.object_records[0][5], 100.0)
 
-    def test_low_overlap_instances_remain_separate(self):
+    def test_distant_same_category_instances_remain_separate(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
             json_dir = base / "annotations"
@@ -101,7 +101,7 @@ class InstancePostprocessingTests(unittest.TestCase):
                 },
                 {
                     "category": "nanocluster",
-                    "segmentation": [[8, 0], [18, 0], [18, 10], [8, 10]],
+                    "segmentation": [[17, 17], [27, 17], [27, 27], [17, 27]],
                 },
             ]
             (json_dir / "frame_0001.json").write_text(
@@ -118,6 +118,119 @@ class InstancePostprocessingTests(unittest.TestCase):
                 tracker.process_all_frames()
 
             self.assertEqual(len(tracker.object_records), 2)
+            self.assertEqual(tracker.same_category_suppressed_count, 0)
+
+    def test_upper_and_lower_fragments_merge_by_boundary_contact(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            json_dir = base / "annotations"
+            json_dir.mkdir()
+            objects = [
+                {
+                    "category": "nanocluster",
+                    "segmentation": [[0, 0], [20, 0], [20, 8], [0, 8]],
+                },
+                {
+                    "category": "nanocluster",
+                    "segmentation": [[0, 11], [20, 11], [20, 19], [0, 19]],
+                },
+            ]
+            (json_dir / "frame_0001.json").write_text(
+                json.dumps({"objects": objects}), encoding="utf-8"
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                tracker = GasTracker(
+                    json_dir=str(json_dir),
+                    nm_per_px=1.0,
+                    target_category="nanocluster",
+                    output_root=str(base / "output"),
+                )
+                tracker.process_all_frames()
+
+            self.assertEqual(len(tracker.object_records), 1)
+            self.assertEqual(tracker.same_category_suppressed_count, 1)
+            self.assertEqual(
+                tracker.instance_postprocess_records[0]["reason"],
+                "same_category_contact_merge",
+            )
+            self.assertGreater(tracker.object_records[0][5], 320.0)
+
+    def test_transient_split_fragments_merge_against_same_previous_instance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            json_dir = base / "annotations"
+            json_dir.mkdir()
+            previous = {
+                "category": "nanodroplet",
+                "segmentation": [[0, 0], [50, 0], [50, 20], [0, 20]],
+            }
+            fragments = [
+                {
+                    "category": "nanodroplet",
+                    "segmentation": [[0, 0], [20, 0], [20, 20], [0, 20]],
+                },
+                {
+                    "category": "nanodroplet",
+                    "segmentation": [[32, 0], [50, 0], [50, 20], [32, 20]],
+                },
+            ]
+            (json_dir / "frame_0001.json").write_text(
+                json.dumps({"objects": [previous]}), encoding="utf-8"
+            )
+            (json_dir / "frame_0002.json").write_text(
+                json.dumps({"objects": fragments}), encoding="utf-8"
+            )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                tracker = GasTracker(
+                    json_dir=str(json_dir),
+                    nm_per_px=1.0,
+                    target_category="nanodroplet",
+                    output_root=str(base / "output"),
+                )
+                tracker.process_all_frames()
+
+            frame_counts = defaultdict(int)
+            for record in tracker.object_records:
+                frame_counts[record[1]] += 1
+            self.assertEqual(frame_counts, {"frame_0001": 1, "frame_0002": 1})
+            self.assertEqual(tracker.same_category_suppressed_count, 1)
+            self.assertEqual(
+                tracker.instance_postprocess_records[0]["reason"],
+                "same_category_temporal_contact_merge",
+            )
+
+    def test_nearby_persistent_instances_do_not_share_temporal_merge(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            json_dir = base / "annotations"
+            json_dir.mkdir()
+            separate = [
+                {
+                    "category": "nanodroplet",
+                    "segmentation": [[0, 0], [20, 0], [20, 20], [0, 20]],
+                },
+                {
+                    "category": "nanodroplet",
+                    "segmentation": [[32, 0], [50, 0], [50, 20], [32, 20]],
+                },
+            ]
+            for frame in (1, 2):
+                (json_dir / f"frame_{frame:04d}.json").write_text(
+                    json.dumps({"objects": separate}), encoding="utf-8"
+                )
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                tracker = GasTracker(
+                    json_dir=str(json_dir),
+                    nm_per_px=1.0,
+                    target_category="nanodroplet",
+                    output_root=str(base / "output"),
+                )
+                tracker.process_all_frames()
+
+            self.assertEqual(len(tracker.object_records), 4)
             self.assertEqual(tracker.same_category_suppressed_count, 0)
 
     def test_fully_overlapping_particle_and_droplet_remain_separate(self):

@@ -128,6 +128,15 @@ class AnalysisPipeline:
             droplet_category=cfg.analysis.droplet_category,
             instance_overlap_postprocess_enabled=cfg.analysis.instance_overlap_postprocess_enabled,
             same_category_containment_threshold=cfg.analysis.same_category_containment_threshold,
+            same_category_contact_gap_px=cfg.analysis.same_category_contact_gap_px,
+            same_category_contact_threshold=cfg.analysis.same_category_contact_threshold,
+            same_category_temporal_gap_px=cfg.analysis.same_category_temporal_gap_px,
+            same_category_temporal_contact_threshold=(
+                cfg.analysis.same_category_temporal_contact_threshold
+            ),
+            same_category_temporal_coverage_threshold=(
+                cfg.analysis.same_category_temporal_coverage_threshold
+            ),
             output_root=cfg.output.root,
         )
 
