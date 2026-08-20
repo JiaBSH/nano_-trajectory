@@ -65,6 +65,49 @@ class ConfigTests(unittest.TestCase):
                 }
             )
 
+    def test_pin_centroid_smoothing_alpha_must_be_in_unit_interval(self):
+        for alpha in (0, -0.1, 1.1):
+            with self.subTest(alpha=alpha), self.assertRaisesRegex(
+                ConfigError, "pin_centroid_smoothing_alpha"
+            ):
+                RawFrameConfig.from_dict(
+                    {
+                        "input": {"json_dir": "annotations"},
+                        "analysis": {"pin_centroid_smoothing_alpha": alpha},
+                    }
+                )
+
+    def test_pin_centroid_smoothing_is_passed_to_tracker(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            json_dir = base / "annotations"
+            json_dir.mkdir()
+            config = RawFrameConfig(
+                input=InputConfig(json_dir=str(json_dir)),
+                analysis=AnalysisConfig(pin_centroid_smoothing_alpha=0.4),
+                output=OutputConfig(root=str(base / "output")),
+                plots=PlotConfig(
+                    save_evolution=False,
+                    save_centroid_trajectories=False,
+                    save_area_trajectories=False,
+                    save_frame_count_area=False,
+                    save_area_delta=False,
+                    save_velocity_trajectories=False,
+                ),
+            )
+            created = []
+
+            def factory(**kwargs):
+                tracker = FakeTracker(**kwargs)
+                created.append(tracker)
+                return tracker
+
+            AnalysisPipeline(config, factory, log=lambda _message: None).run()
+
+            self.assertEqual(
+                created[0].constructor_kwargs["pin_centroid_smoothing_alpha"], 0.4
+            )
+
     def test_tracking_distance_must_match_across_outputs(self):
         with self.assertRaisesRegex(ConfigError, "object IDs stay consistent"):
             RawFrameConfig.from_dict(
@@ -134,6 +177,9 @@ class FakeTracker:
     def export_results(self, **kwargs):
         self.calls.append(("export_results", kwargs))
 
+    def validate_exported_csv_ids(self):
+        self.calls.append(("validate_exported_csv_ids", {}))
+
 
 class PipelineTests(unittest.TestCase):
     def test_pipeline_saves_effective_config_and_runs_selected_steps(self):
@@ -165,11 +211,19 @@ class PipelineTests(unittest.TestCase):
 
             self.assertEqual(
                 result.completed_steps,
-                ("process_all_frames", "export_results"),
+                (
+                    "process_all_frames",
+                    "export_results",
+                    "validate_exported_csv_ids",
+                ),
             )
             self.assertEqual(
                 [name for name, _kwargs in created[0].calls],
-                ["process_all_frames", "export_results"],
+                [
+                    "process_all_frames",
+                    "export_results",
+                    "validate_exported_csv_ids",
+                ],
             )
             self.assertEqual(
                 created[0].constructor_kwargs["output_root"], str(output_dir)
@@ -352,7 +406,10 @@ class PipelineTests(unittest.TestCase):
                 "gas_velocity_trajectories.png",
                 "run_config.json",
             }
-            self.assertEqual(len(result.completed_steps), 10)
+            self.assertEqual(len(result.completed_steps), 11)
+            self.assertEqual(
+                result.completed_steps[-1], "validate_exported_csv_ids"
+            )
             self.assertTrue(
                 all((output_dir / filename).is_file() for filename in expected_outputs)
             )

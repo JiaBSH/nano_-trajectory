@@ -48,6 +48,7 @@ class GasTracker(
         pin_category="pin",
         pin_reference_enabled=False,
         skip_frames_without_pin=True,
+        pin_centroid_smoothing_alpha=0.25,
         max_particle_pin_distance_nm=None,
         fastplot_enabled=True,
         compute_diameter_height_enabled=True,
@@ -72,6 +73,7 @@ class GasTracker(
             pin_category=pin_category,
             pin_reference_enabled=pin_reference_enabled,
             skip_frames_without_pin=skip_frames_without_pin,
+            pin_centroid_smoothing_alpha=pin_centroid_smoothing_alpha,
             max_particle_pin_distance_nm=max_particle_pin_distance_nm,
             fastplot_enabled=fastplot_enabled,
             compute_diameter_height_enabled=compute_diameter_height_enabled,
@@ -101,6 +103,7 @@ class GasTracker(
         pin_category,
         pin_reference_enabled,
         skip_frames_without_pin,
+        pin_centroid_smoothing_alpha,
         max_particle_pin_distance_nm,
         fastplot_enabled,
         compute_diameter_height_enabled,
@@ -120,6 +123,9 @@ class GasTracker(
         self.pin_category = pin_category
         self.pin_reference_enabled = bool(pin_reference_enabled)
         self.skip_frames_without_pin = bool(skip_frames_without_pin)
+        self.pin_centroid_smoothing_alpha = self._unit_interval_float(
+            "pin_centroid_smoothing_alpha", pin_centroid_smoothing_alpha
+        )
         self.max_particle_pin_distance_nm = self._positive_optional_float(
             "max_particle_pin_distance_nm", max_particle_pin_distance_nm
         )
@@ -162,6 +168,13 @@ class GasTracker(
         normalized = float(value)
         if normalized <= 0:
             raise ValueError(f"{name} must be positive, got {normalized}")
+        return normalized
+
+    @staticmethod
+    def _unit_interval_float(name, value):
+        normalized = float(value)
+        if not 0.0 < normalized <= 1.0:
+            raise ValueError(f"{name} must be in (0, 1], got {normalized}")
         return normalized
 
     def _initialize_run_state(self):
@@ -243,6 +256,7 @@ class GasTracker(
 
     def _initialize_spatial_reference(self):
         self.ref_pin_centroid = None
+        self.stabilized_pin_centroid = None
         self.last_shift = np.zeros(2)
 
     def _initialize_image_dimensions(self):

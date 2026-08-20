@@ -36,6 +36,7 @@ class AnalysisConfig:
     droplet_category: str = "nanodroplet"
     pin_reference_enabled: bool = False
     skip_frames_without_pin: bool = True
+    pin_centroid_smoothing_alpha: float = 0.25
     max_particle_pin_distance_nm: float | None = None
     fastplot_enabled: bool = True
     compute_diameter_height_enabled: bool = False
@@ -350,6 +351,15 @@ class RawFrameConfig:
             "compute_boundary_distances_enabled",
         ):
             _require_bool(f"analysis.{name}", getattr(self.analysis, name))
+        _require_number(
+            "analysis.pin_centroid_smoothing_alpha",
+            self.analysis.pin_centroid_smoothing_alpha,
+            strictly_positive=True,
+        )
+        if float(self.analysis.pin_centroid_smoothing_alpha) > 1.0:
+            raise ConfigError(
+                "'analysis.pin_centroid_smoothing_alpha' must be at most 1"
+            )
         if self.analysis.max_particle_pin_distance_nm is not None:
             _require_number(
                 "analysis.max_particle_pin_distance_nm",

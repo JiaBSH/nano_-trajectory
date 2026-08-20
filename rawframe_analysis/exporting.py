@@ -4,10 +4,143 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 
 
 class CsvExportMixin:
     """Provide csv result serialization."""
+
+    def _export_instance_label(self, instance_id):
+        """Return the same compact ID used by pair annotations and plots."""
+        return self._format_category_display_id(int(instance_id))
+
+    @staticmethod
+    def _csv_object_key(row):
+        """Return the cross-table key shared by per-instance result rows."""
+        return (
+            str(row.get("instance_id", "")),
+            str(row.get("frame_id", "")),
+            str(row.get("frame_name", "")),
+        )
+
+    def validate_exported_csv_ids(self):
+        """Fail the run if any exported CSV uses an inconsistent object ID.
+
+        Frame-level aggregate/reference tables intentionally have no object ID.
+        Every object-level ID column is checked, and the complete target tables
+        must contain exactly the same (instance_id, frame_id, frame_name) keys.
+        """
+        target_prefix = self._category_id_prefix()
+        id_prefixes = {
+            "instance_id": target_prefix,
+            "particle_id": "P",
+            "particle_1_id": "P",
+            "particle_2_id": "P",
+            "nearest_particle_id": "P",
+            "droplet_id": "D",
+            "nearest_droplet_id": "D",
+        }
+        csv_rows = {}
+        csv_fields = {}
+        checked_columns = []
+        for filename in sorted(os.listdir(self.output_root)):
+            if not filename.lower().endswith(".csv"):
+                continue
+            path = os.path.join(self.output_root, filename)
+            with open(path, "r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                rows = list(reader)
+                fieldnames = list(reader.fieldnames or [])
+            csv_rows[filename] = rows
+            csv_fields[filename] = fieldnames
+            for column, prefix in id_prefixes.items():
+                if column not in fieldnames:
+                    continue
+                checked_columns.append((filename, column))
+                pattern = re.compile(rf"^{re.escape(prefix)}[1-9][0-9]*$")
+                invalid = sorted(
+                    {
+                        str(row.get(column, ""))
+                        for row in rows
+                        if str(row.get(column, ""))
+                        and pattern.fullmatch(str(row.get(column, ""))) is None
+                    }
+                )
+                if invalid:
+                    raise ValueError(
+                        f"CSV ID validation failed: {filename}.{column} "
+                        f"contains invalid values {invalid[:10]}"
+                    )
+
+        object_file_patterns = (
+            f"{self.target_category}_area_vs_frame.csv",
+            f"{self.target_category}_centroids.csv",
+            f"{self.target_category}_contours_by_frame.csv",
+            f"{self.target_category}_diameter_height_vs_frame.csv",
+            f"{self.target_category}_filtered_far_from_pin.csv",
+            f"{self.target_category}_instance_area_vs_frame.csv",
+            f"{self.target_category}_tracked_area_vs_frame.csv",
+        )
+        for filename in csv_rows:
+            is_speed = filename.startswith(
+                f"{self.target_category}_instance_speed_"
+            ) and filename.endswith(".csv")
+            if (
+                filename in object_file_patterns or is_speed
+            ) and "instance_id" not in csv_fields[filename]:
+                raise ValueError(
+                    f"CSV ID validation failed: {filename} is an object-level "
+                    "table but has no instance_id column"
+                )
+
+        complete_files = [
+            f"{self.target_category}_area_vs_frame.csv",
+            f"{self.target_category}_centroids.csv",
+            f"{self.target_category}_contours_by_frame.csv",
+            f"{self.target_category}_diameter_height_vs_frame.csv",
+            f"{self.target_category}_instance_area_vs_frame.csv",
+        ]
+        present_complete = [name for name in complete_files if name in csv_rows]
+        if present_complete:
+            canonical_name = present_complete[0]
+            canonical = {
+                self._csv_object_key(row) for row in csv_rows[canonical_name]
+            }
+            for filename in present_complete[1:]:
+                candidate = {
+                    self._csv_object_key(row) for row in csv_rows[filename]
+                }
+                if candidate != canonical:
+                    raise ValueError(
+                        f"CSV ID validation failed: {filename} object/frame keys "
+                        f"do not match {canonical_name}"
+                    )
+
+            speed_names = [
+                name
+                for name in csv_rows
+                if name.startswith(f"{self.target_category}_instance_speed_")
+                and name.endswith(".csv")
+            ]
+            for filename in speed_names:
+                speed_keys = {
+                    self._csv_object_key(row) for row in csv_rows[filename]
+                }
+                if not speed_keys.issubset(canonical):
+                    raise ValueError(
+                        f"CSV ID validation failed: {filename} contains "
+                        "object/frame keys absent from the complete target tables"
+                    )
+
+        print(
+            f"[validate] CSV object IDs passed: files={len(csv_rows)}, "
+            f"id_columns={len(checked_columns)}"
+        )
+        return {
+            "files": len(csv_rows),
+            "id_columns": len(checked_columns),
+            "complete_tables": len(present_complete),
+        }
 
     def _build_export_instance_ids(
         self, max_dist=50.0, id_mode="event", use_display_id=True
@@ -66,7 +199,7 @@ class CsvExportMixin:
             writer.writerows(
                 [
                     [
-                        int(instance_id),
+                        self._export_instance_label(instance_id),
                         frame_id,
                         frame_name,
                         f"{nm_per_px:.6f}",
@@ -89,7 +222,7 @@ class CsvExportMixin:
             )
             writer.writerows(
                 [
-                    [int(instance_id)] + row
+                    [self._export_instance_label(instance_id)] + row
                     for instance_id, row in zip(export_ids, self.contour_records)
                 ]
             )
@@ -111,7 +244,7 @@ class CsvExportMixin:
             writer.writerows(
                 [
                     [
-                        int(instance_id),
+                        self._export_instance_label(instance_id),
                         frame_id,
                         frame_name,
                         f"{nm_per_px:.6f}",
@@ -151,7 +284,7 @@ class CsvExportMixin:
                 # we only export the first 7 fields here
                 writer.writerow(
                     [
-                        int(instance_id),
+                        self._export_instance_label(instance_id),
                         row[0],
                         row[1],
                         f"{row[2]:.6f}",
@@ -207,10 +340,30 @@ class CsvExportMixin:
             path6 = os.path.join(
                 self.output_root, f"{self.target_category}_filtered_far_from_pin.csv"
             )
+            filtered_ids_by_frame = {}
+            if self.filtered_far_particle_records:
+                normalized_target = str(self.target_category).strip().lower()
+                if normalized_target == str(self.particle_category).strip().lower():
+                    target_tracking_records = self.boundary_particle_records
+                elif normalized_target == str(self.droplet_category).strip().lower():
+                    target_tracking_records = self.boundary_droplet_records
+                else:
+                    target_tracking_records = []
+                if not target_tracking_records:
+                    raise ValueError(
+                        "Cannot export consistent IDs for filtered_far_from_pin: "
+                        "enable boundary-distance processing for the target category"
+                    )
+                filtered_ids_by_frame = self._tracked_category_ids(
+                    target_tracking_records,
+                    max_dist=max_dist,
+                    category=self.target_category,
+                )
             with open(path6, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(
                     [
+                        "instance_id",
                         "frame_id",
                         "frame_name",
                         "nm_per_pixel",
@@ -231,9 +384,20 @@ class CsvExportMixin:
                         dist_nm,
                         threshold_nm,
                         area_nm2,
+                        frame_instance_index,
                     ) = row
+                    frame_ids = filtered_ids_by_frame.get(int(frame_id), [])
+                    zero_based_index = int(frame_instance_index) - 1
+                    if zero_based_index < 0 or zero_based_index >= len(frame_ids):
+                        raise ValueError(
+                            "Missing annotated instance ID for filtered object: "
+                            f"frame={frame_id}, frame_index={frame_instance_index}"
+                        )
                     writer.writerow(
                         [
+                            self._format_category_display_id(
+                                frame_ids[zero_based_index], self.target_category
+                            ),
                             int(frame_id),
                             frame_name,
                             f"{float(nm_per_px):.6f}",
@@ -393,7 +557,7 @@ class CsvExportMixin:
     def export_tracked_area_results(self, tracks, out_csv=None):
         """Export tracked area series.
 
-        CSV columns: track_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
+        CSV columns: instance_id, frame_id, frame_name, nm_per_pixel, area_nm2, cx_nm, cy_nm
         """
         if out_csv is None:
             out_csv = os.path.join(
@@ -403,11 +567,12 @@ class CsvExportMixin:
             out_csv = os.path.join(self.output_root, out_csv)
 
         rows = []
-        for track_id, t in enumerate(tracks):
+        for track_id, t in enumerate(tracks, start=1):
+            instance_label = self._export_instance_label(track_id)
             for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in t["points"]:
                 rows.append(
                     [
-                        track_id,
+                        instance_label,
                         frame_id,
                         frame_name,
                         f"{nm_per_px:.6f}",
@@ -417,12 +582,13 @@ class CsvExportMixin:
                     ]
                 )
 
-        rows.sort(key=lambda r: (r[0], r[1]))
+        prefix = self._category_id_prefix()
+        rows.sort(key=lambda r: (int(str(r[0])[len(prefix) :]), r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
-                    "track_id",
+                    "instance_id",
                     "frame_id",
                     "frame_name",
                     "nm_per_pixel",
@@ -454,10 +620,11 @@ class CsvExportMixin:
                 if display_id_of is None
                 else display_id_of.get(int(instance_id), int(instance_id))
             )
+            exported_label = self._export_instance_label(exported_id)
             for frame_id, frame_name, nm_per_px, cx_nm, cy_nm, area_nm2 in points:
                 rows.append(
                     [
-                        exported_id,
+                        exported_label,
                         int(frame_id),
                         frame_name,
                         f"{float(nm_per_px):.6f}",
@@ -467,7 +634,8 @@ class CsvExportMixin:
                     ]
                 )
 
-        rows.sort(key=lambda r: (r[0], r[1]))
+        prefix = self._category_id_prefix()
+        rows.sort(key=lambda r: (int(str(r[0])[len(prefix) :]), r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
@@ -509,17 +677,19 @@ class CsvExportMixin:
                 if display_id_of is None
                 else display_id_of.get(int(instance_id), int(instance_id))
             )
+            exported_label = self._export_instance_label(exported_id)
             for frame_id, frame_name, speed_nm_per_s in points:
                 rows.append(
                     [
-                        exported_id,
+                        exported_label,
                         int(frame_id),
                         frame_name,
                         f"{float(speed_nm_per_s):.6f}",
                     ]
                 )
 
-        rows.sort(key=lambda r: (r[0], r[1]))
+        prefix = self._category_id_prefix()
+        rows.sort(key=lambda r: (int(str(r[0])[len(prefix) :]), r[1]))
         with open(out_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["instance_id", "frame_id", "frame_name", "speed_nm_per_s"])

@@ -63,8 +63,10 @@ the shared centroid-linking threshold in `output.export_max_dist_nm`. The same
 value must be used in `plots.max_dist_nm`, ensuring every stable ID is identical
 across CSV files, plots, and raw-frame annotations. Every stable pair ID gets
 its own distance curve, and missing frames break rather than interpolate the line.
-For a droplet target, `D1` is the same object as `instance_id=1` in the centroid,
-area, and speed CSV files; particle targets follow the equivalent `P1` rule.
+For a droplet target, `D1` is written as `instance_id=D1` in the centroid,
+area, contour, diameter/height, and speed CSV files; particle targets use `P1`.
+The exported value therefore matches the raw-frame annotation exactly and can be
+used as a direct join/search key without adding or removing a prefix.
 One-frame tracks have no computable speed and are omitted from the speed output,
 but the remaining IDs are never renumbered.
 

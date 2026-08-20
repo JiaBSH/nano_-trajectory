@@ -69,7 +69,143 @@ class TrackingCacheTests(unittest.TestCase):
             with output_path.open("r", newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))
 
-        self.assertEqual({int(row["instance_id"]) for row in rows}, {2})
+        self.assertEqual({row["instance_id"] for row in rows}, {"D2"})
+
+    def test_area_export_uses_the_same_prefixed_id_as_annotations(self):
+        self.tracker.target_category = "nanocluster"
+        self.tracker.particle_category = "nanocluster"
+        self.tracker.droplet_category = "nanodroplet"
+        series = {7: [(3, "frame-3", 1.0, 2.0, 4.0, 6.0)]}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "area.csv"
+            self.tracker.export_id_series(series, out_csv=str(output_path))
+            with output_path.open("r", newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows[0]["instance_id"], "P7")
+
+    def test_primary_droplet_exports_all_use_annotation_id(self):
+        self.tracker.json_files = ["frame-0.json"]
+        self.tracker.target_category = "nanodroplet"
+        self.tracker.particle_category = "nanocluster"
+        self.tracker.droplet_category = "nanodroplet"
+        self.tracker.object_records = [object_record(0, 2.0)]
+        self.tracker.area_records = [[0, "frame-0", 1.0, 10.0]]
+        self.tracker.contour_records = [[0, "frame-0", "(0.000,0.000)"]]
+        self.tracker.centroid_records = [[0, "frame-0", 1.0, 2.0, 0.0]]
+        self.tracker.diameter_height_records = [
+            [0, "frame-0", 1.0, 2.0, 0.0, 3.0, 4.0]
+        ]
+        self.tracker.pin_reference_enabled = False
+        self.tracker.compute_boundary_distances_enabled = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.tracker.output_root = temp_dir
+            self.tracker.export_results(max_dist=10.0)
+            filenames = [
+                "nanodroplet_area_vs_frame.csv",
+                "nanodroplet_contours_by_frame.csv",
+                "nanodroplet_centroids.csv",
+                "nanodroplet_diameter_height_vs_frame.csv",
+            ]
+            exported_ids = []
+            for filename in filenames:
+                with (Path(temp_dir) / filename).open(
+                    "r", newline="", encoding="utf-8"
+                ) as handle:
+                    exported_ids.append(next(csv.DictReader(handle))["instance_id"])
+
+        self.assertEqual(exported_ids, ["D1", "D1", "D1", "D1"])
+
+    def test_csv_validator_checks_all_object_table_ids(self):
+        self.tracker.target_category = "nanodroplet"
+        self.tracker.particle_category = "nanocluster"
+        self.tracker.droplet_category = "nanodroplet"
+        full_header = "instance_id,frame_id,frame_name,value\n"
+        full_row = "D1,0,frame-0,1\n"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.tracker.output_root = temp_dir
+            for suffix in (
+                "area_vs_frame",
+                "centroids",
+                "contours_by_frame",
+                "diameter_height_vs_frame",
+                "instance_area_vs_frame",
+            ):
+                (Path(temp_dir) / f"nanodroplet_{suffix}.csv").write_text(
+                    full_header + full_row, encoding="utf-8"
+                )
+            (Path(temp_dir) / "nanodroplet_instance_speed_mean_5frames.csv").write_text(
+                "instance_id,frame_id,frame_name,speed_nm_per_s\n"
+                "D1,0,frame-0,2\n",
+                encoding="utf-8",
+            )
+            (Path(temp_dir) / "nanocluster_to_nanodroplet_boundary_distances.csv").write_text(
+                "frame_id,particle_id,droplet_id\n0,P1,D1\n",
+                encoding="utf-8",
+            )
+
+            report = self.tracker.validate_exported_csv_ids()
+
+            self.assertEqual(report["files"], 7)
+            self.assertEqual(report["complete_tables"], 5)
+            self.assertGreaterEqual(report["id_columns"], 8)
+
+            bad_path = Path(temp_dir) / "nanodroplet_centroids.csv"
+            bad_path.write_text(full_header + "1,0,frame-0,1\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "centroids.csv.instance_id"):
+                self.tracker.validate_exported_csv_ids()
+
+    def test_filtered_far_export_uses_boundary_annotation_id(self):
+        self.tracker.json_files = ["frame-0.json"]
+        self.tracker.target_category = "nanodroplet"
+        self.tracker.particle_category = "nanocluster"
+        self.tracker.droplet_category = "nanodroplet"
+        self.tracker.object_records = [object_record(0, 2.0)]
+        self.tracker.area_records = [[0, "frame-0", 1.0, 10.0]]
+        self.tracker.contour_records = [[0, "frame-0", "(0.000,0.000)"]]
+        self.tracker.centroid_records = [[0, "frame-0", 1.0, 2.0, 0.0]]
+        self.tracker.diameter_height_records = [
+            [0, "frame-0", 1.0, 2.0, 0.0, 3.0, 4.0]
+        ]
+        self.tracker.pin_reference_enabled = True
+        self.tracker.max_particle_pin_distance_nm = 50.0
+        self.tracker.pin_reference_records = []
+        self.tracker.filtered_far_particle_records = [
+            [0, "frame-0", 1.0, 100.0, 0.0, 100.0, 50.0, 8.0, 2]
+        ]
+        self.tracker.boundary_particle_records = []
+        self.tracker.boundary_droplet_records = [
+            [0, "frame-0", 1.0, 1, 0, 2.0, 0.0, 10.0],
+            [0, "frame-0", 1.0, 2, 1, 100.0, 0.0, 8.0],
+        ]
+        self.tracker.compute_boundary_distances_enabled = False
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.tracker.output_root = temp_dir
+            self.tracker.export_results(max_dist=10.0)
+            with (Path(temp_dir) / "nanodroplet_filtered_far_from_pin.csv").open(
+                "r", newline="", encoding="utf-8"
+            ) as handle:
+                rows = list(csv.DictReader(handle))
+
+        self.assertEqual(rows[0]["instance_id"], "D2")
+
+    def test_csv_validator_rejects_object_table_without_instance_id(self):
+        self.tracker.target_category = "nanodroplet"
+        self.tracker.particle_category = "nanocluster"
+        self.tracker.droplet_category = "nanodroplet"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self.tracker.output_root = temp_dir
+            (Path(temp_dir) / "nanodroplet_filtered_far_from_pin.csv").write_text(
+                "frame_id,frame_name,distance_to_pin_nm\n", encoding="utf-8"
+            )
+
+            with self.assertRaisesRegex(ValueError, "has no instance_id column"):
+                self.tracker.validate_exported_csv_ids()
 
     def test_event_ids_are_rebuilt_after_record_context_is_replaced(self):
         full_records = [

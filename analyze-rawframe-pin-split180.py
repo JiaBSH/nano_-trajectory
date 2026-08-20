@@ -505,7 +505,7 @@ class PinSplitGasTracker(GasTracker):
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for instance_id, rec in zip(export_ids, self.split_records):
-                row = {"instance_id": int(instance_id)}
+                row = {"instance_id": self._export_instance_label(instance_id)}
                 row.update(rec)
                 writer.writerow(row)
         print(f" - {path}")

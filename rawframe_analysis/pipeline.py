@@ -20,6 +20,8 @@ class TrackerProtocol(Protocol):
 
     def export_results(self, **kwargs: Any) -> Any: ...
 
+    def validate_exported_csv_ids(self) -> Any: ...
+
     def annotate_images_on_rawframe(self, **kwargs: Any) -> Any: ...
 
     def annotate_allcategories_on_rawframe(self, **kwargs: Any) -> Any: ...
@@ -117,6 +119,7 @@ class AnalysisPipeline:
             pin_category=cfg.analysis.pin_category,
             pin_reference_enabled=cfg.analysis.pin_reference_enabled,
             skip_frames_without_pin=cfg.analysis.skip_frames_without_pin,
+            pin_centroid_smoothing_alpha=cfg.analysis.pin_centroid_smoothing_alpha,
             max_particle_pin_distance_nm=cfg.analysis.max_particle_pin_distance_nm,
             fastplot_enabled=cfg.analysis.fastplot_enabled,
             compute_diameter_height_enabled=cfg.analysis.compute_diameter_height_enabled,
@@ -269,6 +272,13 @@ class AnalysisPipeline:
                         max_legend_items=plots.max_legend_items,
                         debug_stats=plots.debug_stats,
                     ),
+                )
+            )
+        if cfg.output.export_csv_results:
+            steps.append(
+                PipelineStep(
+                    "validate_exported_csv_ids",
+                    tracker.validate_exported_csv_ids,
                 )
             )
         return steps

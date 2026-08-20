@@ -33,13 +33,18 @@ class FrameProcessingMixin:
                 continue
 
             if self.pin_reference_enabled:
-                pin_centroid = self._compute_pin_centroid(data)
-                if pin_centroid is None:
+                raw_pin_centroid = self._compute_pin_centroid(data)
+                if raw_pin_centroid is None:
                     self.skipped_no_pin_frames += 1
                     if self.skip_frames_without_pin:
                         continue
-                    shift = self._compute_pin_shift(data)
+                    shift = (
+                        self.stabilized_pin_centroid.copy()
+                        if self.stabilized_pin_centroid is not None
+                        else np.zeros(2, dtype=np.float64)
+                    )
                 else:
+                    pin_centroid = self._stabilize_pin_centroid(raw_pin_centroid)
                     shift = pin_centroid
                     self.pin_reference_records.append(
                         [
@@ -252,9 +257,28 @@ class FrameProcessingMixin:
 
         return None
 
+    def _stabilize_pin_centroid(self, pin_centroid):
+        """Return a causal EMA-smoothed pin centroid in pixel coordinates.
+
+        The first valid observation initializes the filter exactly.  Keeping the
+        state in pixels makes the same stabilized reference available to every
+        downstream coordinate calculation, even when the physical scale changes
+        between frames.
+        """
+        observation = np.asarray(pin_centroid, dtype=np.float64)
+        if self.stabilized_pin_centroid is None:
+            self.stabilized_pin_centroid = observation.copy()
+        else:
+            alpha = float(self.pin_centroid_smoothing_alpha)
+            self.stabilized_pin_centroid += alpha * (
+                observation - self.stabilized_pin_centroid
+            )
+        return self.stabilized_pin_centroid.copy()
+
     def _compute_pin_shift(self, data):
         pin_centroid = self._compute_pin_centroid(data)
         if pin_centroid is not None:
+            pin_centroid = self._stabilize_pin_centroid(pin_centroid)
             if self.ref_pin_centroid is None:
                 self.ref_pin_centroid = pin_centroid.copy()
 
@@ -266,6 +290,7 @@ class FrameProcessingMixin:
         return shift
 
     def _process_target_objects(self, data, frame_id, frame_name, nm_per_px, shift):
+        target_frame_index = 0
         for obj in data.get("objects", []):
             if obj.get("category") != self.target_category:
                 continue
@@ -275,6 +300,7 @@ class FrameProcessingMixin:
 
             if pts.shape[0] < 3:
                 continue
+            target_frame_index += 1
 
             # ---- 面积 ----
             area_px2 = self.polygon_area(pts)
@@ -301,6 +327,7 @@ class FrameProcessingMixin:
                             dist_nm,
                             float(max_pin_dist),
                             area_nm2,
+                            int(target_frame_index),
                         ]
                     )
                     continue
